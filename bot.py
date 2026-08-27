@@ -297,6 +297,20 @@ async def admin_photo(update,context):
     admin_text=f"🔔 *BUKTI PEMBAYARAN BARU*\n\n🆔 `ORD-{oid:05d}`\n👤 User ID: `{uid}`\n📦 {product}\n💰 {price}\n📌 Status: Bukti diterima"
     await notify_admins(context,admin_text,admin_order_buttons(oid),photo=update.message.photo[-1].file_id)
 
+async def show_chat_id(update,context):
+    if update.effective_chat.type in ("group","supergroup"):
+        await update.message.reply_text(
+            f"🆔 *ID Grup Ini:*\\n`{update.effective_chat.id}`\\n\\n"
+            "Masukkan angka ini ke Railway → Variables → `ADMIN_GROUP_ID`.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"🆔 Chat ID kamu: `{update.effective_chat.id}`\\n\\n"
+            "Jalankan /id di grup admin untuk mendapatkan ADMIN_GROUP_ID.",
+            parse_mode="Markdown"
+        )
+
 async def admin_products(update,context):
     if update.effective_user.id not in ADMIN_IDS: return
     await update.message.reply_text("👑 *Admin Panel*",parse_mode="Markdown",reply_markup=admin_menu())
@@ -328,7 +342,7 @@ async def adminpanel(update,context):
 def main():
     if not TOKEN: raise RuntimeError("BOT_TOKEN belum diisi.")
     db(); app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("add",admin_add)); app.add_handler(CommandHandler("products",admin_products)); app.add_handler(CommandHandler("delete",admin_delete)); app.add_handler(CommandHandler("edit",admin_edit)); app.add_handler(CommandHandler("setpayment",admin_setpayment)); app.add_handler(CommandHandler("admin",adminpanel))
+    app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("add",admin_add)); app.add_handler(CommandHandler("products",admin_products)); app.add_handler(CommandHandler("delete",admin_delete)); app.add_handler(CommandHandler("edit",admin_edit)); app.add_handler(CommandHandler("setpayment",admin_setpayment)); app.add_handler(CommandHandler("admin",adminpanel); app.add_handler(CommandHandler("id",show_chat_id)))
     app.add_handler(MessageHandler(filters.PHOTO,admin_photo)); app.add_handler(CallbackQueryHandler(callback)); app.run_polling()
 
 if __name__=="__main__": main()
