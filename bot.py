@@ -1,8 +1,4 @@
 import os, sqlite3, logging, re
-try:
-    import psycopg2
-except ImportError:
-    psycopg2 = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
@@ -13,84 +9,7 @@ ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID", "").strip()
 PAYMENT_INFO = os.getenv("PAYMENT_INFO", "Hubungi admin untuk info pembayaran.")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")
 DB = "store.db"
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 logging.basicConfig(level=logging.INFO)
-
-class DBConn:
-    def __init__(self, raw, postgres=False):
-        self.raw = raw
-        self.postgres = postgres
-
-    def execute(self, sql, params=()):
-        if self.postgres:
-            sql = sql.replace("?", "%s")
-            cur = self.raw.cursor()
-            cur.execute(sql, params)
-            return cur
-        return self.raw.execute(sql, params)
-
-    def commit(self):
-        self.raw.commit()
-
-    def close(self):
-        self.raw.close()
-
-def db():
-    if DATABASE_URL:
-        if psycopg2 is None:
-            raise RuntimeError("DATABASE_URL terdeteksi, tetapi psycopg2 belum terpasang. Tambahkan psycopg2-binary ke requirements.txt.")
-        raw = psycopg2.connect(DATABASE_URL, sslmode="require")
-        con = DBConn(raw, postgres=True)
-        con.execute("""CREATE TABLE IF NOT EXISTS products(
-            id BIGSERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            price TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            photo TEXT DEFAULT ''
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS orders(
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT,
-            product_id BIGINT,
-            status TEXT DEFAULT 'pending_payment'
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY,
-            value TEXT DEFAULT ''
-        )""")
-        con.commit()
-        return con
-
-    raw = sqlite3.connect(DB)
-    con = DBConn(raw, postgres=False)
-    con.execute("""CREATE TABLE IF NOT EXISTS products(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        price TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        photo TEXT DEFAULT ''
-    )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS orders(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        product_id INTEGER,
-        status TEXT DEFAULT 'pending_payment'
-    )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        value TEXT DEFAULT ''
-    )""")
-    con.commit()
-    return con
-
-ALLOWED_TRANSITIONS = {
-    "pending_payment": {"processing", "rejected"},
-    "proof_received": {"processing", "rejected"},
-    "processing": {"paid", "rejected"},
-    "paid": {"completed"},
-    "rejected": {"pending_payment"},
-    "completed": set(),
-}
 
 STATUS_TEXT = {
     "pending_payment": "Menunggu pembayaran",
@@ -100,6 +19,39 @@ STATUS_TEXT = {
     "rejected": "Ditolak",
     "completed": "Selesai",
 }
+
+def db():
+    con = sqlite3.connect(DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS products(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        price TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        photo TEXT DEFAULT '',
+        stock INTEGER DEFAULT -1
+    )""")
+    try:
+        con.execute("ALTER TABLE products ADD COLUMN stock INTEGER DEFAULT -1")
+    except Exception:
+        pass
+    con.execute("""CREATE TABLE IF NOT EXISTS orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        product_id INTEGER,
+        status TEXT DEFAULT 'pending_payment',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        value TEXT DEFAULT ''
+    )""")
+    con.commit()
+    return con
 
 def get_payment():
     con = db()
@@ -124,6 +76,7 @@ def admin_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛒 Kelola Produk", callback_data="adminlist")],
         [InlineKeyboardButton("📦 Kelola Pesanan", callback_data="adminorders")],
+        [InlineKeyboardButton("📊 Statistik Toko", callback_data="adminstats")],
         [InlineKeyboardButton("💳 Edit Payment", callback_data="adminpayment")],
     ])
 
@@ -161,6 +114,12 @@ async def send_home(chat_id, context, text="🔥 *Menu Utama*"):
     await context.bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=menu())
 
 async def start(update, context):
+    uid = update.effective_user.id
+    uname = update.effective_user.username or ""
+    con = db()
+    con.execute("INSERT OR REPLACE INTO users(user_id, username) VALUES(?,?)", (uid, uname))
+    con.commit(); con.close()
+
     if not await is_joined(update, context):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔗 JOIN GRUP", url=f"https://t.me/{REQUIRED_CHAT.lstrip('@')}")],
@@ -213,22 +172,32 @@ async def callback(update, context):
         await send_home(update.effective_user.id, context)
 
     elif data == "catalog":
-        con = db(); rows = con.execute("SELECT id,name,price FROM products ORDER BY id DESC").fetchall(); con.close()
+        con = db(); rows = con.execute("SELECT id, name, price, stock FROM products ORDER BY id DESC").fetchall(); con.close()
         await safe_delete(q.message)
         if not rows:
             await context.bot.send_message(update.effective_user.id, "📭 Katalog masih kosong.", reply_markup=menu())
             return
-        kb = [[InlineKeyboardButton(f"🛍️ {r[1]} • {r[2]}", callback_data=f"product:{r[0]}")] for r in rows]
+        kb = []
+        for r in rows:
+            stk_str = "∞" if r[3] < 0 else str(r[3])
+            kb.append([InlineKeyboardButton(f"🛍️ {r[1]} • {r[2]} (Stok: {stk_str})", callback_data=f"product:{r[0]}")])
         kb.append([InlineKeyboardButton("⬅️ Kembali", callback_data="home")])
         await context.bot.send_message(update.effective_user.id, "🛒 *Katalog Produk*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("product:"):
         pid = int(data.split(":")[1]); con=db()
-        p=con.execute("SELECT id,name,price,description,photo FROM products WHERE id=?",(pid,)).fetchone(); con.close()
+        p=con.execute("SELECT id, name, price, description, photo, stock FROM products WHERE id=?",(pid,)).fetchone(); con.close()
         if not p: await q.answer("Produk tidak ditemukan.",show_alert=True); return
         await safe_delete(q.message)
-        text=f"🛍️ *{p[1]}*\n💰 Harga: `{p[2]}`\n\n{p[3] or 'Tidak ada deskripsi.'}"
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 BELI",callback_data=f"buy:{p[0]}")],[InlineKeyboardButton("⬅️ Katalog",callback_data="catalog")]])
+        stk_str = "Unlimited" if p[5] < 0 else f"{p[5]} Pcs"
+        text=f"🛍️ *{p[1]}*\n💰 Harga: `{p[2]}`\n📦 Stok: `{stk_str}`\n\n📝 Deskripsi:\n{p[3] or 'Tidak ada deskripsi.'}"
+        
+        kb_rows = []
+        if p[5] != 0:
+            kb_rows.append([InlineKeyboardButton("🛒 BELI", callback_data=f"buy:{p[0]}")])
+        kb_rows.append([InlineKeyboardButton("⬅️ Katalog", callback_data="catalog")])
+        kb = InlineKeyboardMarkup(kb_rows)
+        
         if p[4]:
             await context.bot.send_photo(update.effective_user.id,photo=p[4],caption=text,parse_mode="Markdown",reply_markup=kb)
         else:
@@ -236,12 +205,14 @@ async def callback(update, context):
 
     elif data.startswith("buy:"):
         pid=int(data.split(":")[1]); con=db()
-        p=con.execute("SELECT id,name,price FROM products WHERE id=?",(pid,)).fetchone()
+        p=con.execute("SELECT id, name, price, stock FROM products WHERE id=?",(pid,)).fetchone()
         if not p: con.close(); await q.answer("Produk tidak ditemukan.",show_alert=True); return
-        if con.postgres:
-            cur=con.execute("INSERT INTO orders(user_id,product_id,status) VALUES(?,?,?) RETURNING id",(update.effective_user.id,pid,"pending_payment")); oid=cur.fetchone()[0]
-        else:
-            cur=con.execute("INSERT INTO orders(user_id,product_id,status) VALUES(?,?,?)",(update.effective_user.id,pid,"pending_payment")); oid=cur.lastrowid
+        if p[3] == 0:
+            con.close(); await q.answer("❌ Stok produk ini sedang habis!", show_alert=True); return
+        if p[3] > 0:
+            con.execute("UPDATE products SET stock = stock - 1 WHERE id=?", (pid,))
+            
+        cur=con.execute("INSERT INTO orders(user_id,product_id,status) VALUES(?,?,?)",(update.effective_user.id,pid,"pending_payment")); oid=cur.lastrowid
         con.commit(); con.close()
         await safe_delete(q.message)
         text=(f"🧾 *ORDER BERHASIL DIBUAT*\n\n🆔 ID Transaksi: `ORD-{oid:05d}`\n📦 Produk: {p[1]}\n💰 Harga: {p[2]}\n📌 Status: Menunggu pembayaran\n\n💳 *Pembayaran:*\n{get_payment()}\n\nSetelah bayar, kirim *foto bukti pembayaran* ke chat bot ini.\nTulis `ORD-{oid:05d}` di caption foto.")
@@ -258,8 +229,8 @@ async def callback(update, context):
         await context.bot.send_message(update.effective_user.id,f"📤 *Cara Kirim Bukti*\n\n1. Bayar sesuai info pembayaran.\n2. Kirim foto bukti ke chat bot.\n3. Caption wajib berisi `ORD-{oid:05d}`.\n4. Admin akan mengecek.",parse_mode="Markdown",reply_markup=order_buttons(oid,False))
 
     elif data == "orders":
-        con=db(); rows=con.execute("SELECT o.id,p.name,p.price,o.status FROM orders o JOIN products p ON p.id=o.product_id WHERE o.user_id=? ORDER BY o.id DESC",(update.effective_user.id,)).fetchall(); con.close()
-        text="📦 Belum ada pesanan." if not rows else "📦 *Pesanan Saya*\n\n"+"\n".join(f"🆔 ORD-{r[0]:05d}\n📦 {r[1]}\n💰 {r[2]}\n📌 {STATUS_TEXT.get(r[3],r[3])}\n" for r in rows)
+        con=db(); rows=con.execute("SELECT o.id,p.name,p.price,o.status FROM orders o JOIN products p ON p.id=o.product_id WHERE o.user_id=? ORDER BY o.id DESC LIMIT 15",(update.effective_user.id,)).fetchall(); con.close()
+        text="📦 Belum ada pesanan." if not rows else "📦 *Pesanan Saya*\n\n"+"\n".join(f"🆔 `ORD-{r[0]:05d}`\n📦 {r[1]}\n💰 {r[2]}\n📌 {STATUS_TEXT.get(r[3],r[3])}\n" for r in rows)
         await safe_delete(q.message); await context.bot.send_message(update.effective_user.id,text,parse_mode="Markdown",reply_markup=menu())
 
     elif data == "payment":
@@ -270,16 +241,20 @@ async def callback(update, context):
 
     elif data == "adminlist":
         if update.effective_user.id not in ADMIN_IDS: return
-        con=db(); rows=con.execute("SELECT id,name,price FROM products ORDER BY id DESC").fetchall(); con.close()
+        con=db(); rows=con.execute("SELECT id,name,price,stock FROM products ORDER BY id DESC").fetchall(); con.close()
         await safe_delete(q.message)
         if not rows: await context.bot.send_message(update.effective_user.id,"🛒 Katalog kosong.",reply_markup=admin_menu()); return
-        kb=[[InlineKeyboardButton(f"🛍️ {n} • {p}",callback_data=f"adminview:{pid}")] for pid,n,p in rows]
+        kb=[[InlineKeyboardButton(f"🛍️ {n} • {p} (Stok: {'∞' if s < 0 else s})",callback_data=f"adminview:{pid}")] for pid,n,p,s in rows]
         kb.append([InlineKeyboardButton("⬅️ Admin Panel",callback_data="adminhome")])
         await context.bot.send_message(update.effective_user.id,"👑 *Kelola Produk*",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "adminhome":
         if update.effective_user.id not in ADMIN_IDS: return
         await safe_delete(q.message); await context.bot.send_message(update.effective_user.id,"👑 *Admin Panel*",parse_mode="Markdown",reply_markup=admin_menu())
+
+    elif data == "adminstats":
+        if update.effective_user.id not in ADMIN_IDS: return
+        await safe_delete(q.message); await send_admin_stats(update.effective_user.id, context)
 
     elif data == "adminpayment":
         if update.effective_user.id not in ADMIN_IDS: return
@@ -294,10 +269,11 @@ async def callback(update, context):
 
     elif data.startswith("adminview:"):
         if update.effective_user.id not in ADMIN_IDS: return
-        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT id,name,price,description,photo FROM products WHERE id=?",(pid,)).fetchone(); con.close()
+        pid=int(data.split(":")[1]); con=db(); p=con.execute("SELECT id,name,price,description,photo,stock FROM products WHERE id=?",(pid,)).fetchone(); con.close()
         if not p: await q.answer("Produk tidak ditemukan.",show_alert=True); return
         await safe_delete(q.message)
-        text=f"👑 *Kelola Produk*\n\n🆔 ID: `{p[0]}`\n🛍️ {p[1]}\n💰 {p[2]}\n📝 {p[3] or '-'}"
+        stk_str = "Unlimited" if p[5] < 0 else f"{p[5]} Pcs"
+        text=f"👑 *Kelola Produk*\n\n🆔 ID: `{p[0]}`\n🛍️ {p[1]}\n💰 {p[2]}\n📦 Stok: `{stk_str}`\n📝 {p[3] or '-'}"
         kb=InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ HAPUS",callback_data=f"admindelete:{p[0]}"),InlineKeyboardButton("✏️ EDIT",callback_data=f"adminedithelp:{p[0]}")],[InlineKeyboardButton("⬅️ Daftar Produk",callback_data="adminlist")]])
         if p[4]: await context.bot.send_photo(update.effective_user.id,photo=p[4],caption=text,parse_mode="Markdown",reply_markup=kb)
         else: await context.bot.send_message(update.effective_user.id,text,parse_mode="Markdown",reply_markup=kb)
@@ -312,18 +288,13 @@ async def callback(update, context):
     elif data.startswith("adminedithelp:"):
         if update.effective_user.id not in ADMIN_IDS: return
         pid=int(data.split(":")[1]); await safe_delete(q.message)
-        await context.bot.send_message(update.effective_user.id,f"✏️ *Edit Produk #{pid}*\n\n`/edit {pid} | Nama Baru | Harga Baru | Deskripsi Baru`",parse_mode="Markdown",reply_markup=admin_menu())
+        await context.bot.send_message(update.effective_user.id,f"✏️ *Edit Produk #{pid}*\n\n`/edit {pid} | Nama Baru | Harga Baru | Deskripsi Baru | Stok`",parse_mode="Markdown",reply_markup=admin_menu())
 
     elif data.startswith("setstatus:"):
         if update.effective_user.id not in ADMIN_IDS: return
         _,status,oid_text=data.split(":"); oid=int(oid_text)
         con=db(); row=con.execute("SELECT o.user_id,p.name,p.price FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=?",(oid,)).fetchone()
         if not row: con.close(); await q.answer("Order tidak ditemukan.",show_alert=True); return
-        current = con.execute("SELECT status FROM orders WHERE id=?", (oid,)).fetchone()[0]
-        if status not in ALLOWED_TRANSITIONS.get(current, set()):
-            con.close()
-            await q.answer(f"❌ Tidak bisa: {STATUS_TEXT.get(current,current)} → {STATUS_TEXT.get(status,status)}", show_alert=True)
-            return
         con.execute("UPDATE orders SET status=? WHERE id=?",(status,oid)); con.commit(); con.close()
         user_id,product,price=row
         user_msg=f"📦 *Update Order*\n\n🆔 `ORD-{oid:05d}`\n📦 {product}\n💰 {price}\n📌 Status: *{STATUS_TEXT[status]}*"
@@ -338,20 +309,40 @@ async def callback(update, context):
         except Exception:
             pass
 
+async def send_admin_stats(chat_id, context):
+    con = db()
+    tot_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    tot_products = con.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    tot_orders = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    tot_paid = con.execute("SELECT COUNT(*) FROM orders WHERE status IN ('paid', 'completed')").fetchone()[0]
+    con.close()
+    
+    text = (f"📊 *STATISTIK TOKO*\n\n"
+            f"👤 Total Pengguna: `{tot_users}`\n"
+            f"🛍️ Total Produk: `{tot_products}`\n"
+            f"📦 Total Transaksi: `{tot_orders}`\n"
+            f"✅ Transaksi Berhasil: `{tot_paid}`")
+    await context.bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=admin_menu())
+
 async def admin_add(update,context):
     if update.effective_user.id not in ADMIN_IDS: return
     raw=update.message.text.partition(" ")[2].strip(); parts=[x.strip() for x in raw.split("|")]
-    if len(parts)<2: await update.message.reply_text("Format: /add Nama | Harga | Deskripsi"); return
+    if len(parts)<2: await update.message.reply_text("Format: `/add Nama | Harga | Deskripsi | Stok`\n*(Isi stok -1 untuk unlimited)*", parse_mode="Markdown"); return
     name,price=parts[0],parts[1]; desc=parts[2] if len(parts)>2 else ""
-    con=db(); con.execute("INSERT INTO products(name,price,description) VALUES(?,?,?)",(name,price,desc)); con.commit(); con.close(); await update.message.reply_text(f"✅ Produk *{name}* berhasil ditambahkan.",parse_mode="Markdown")
+    stock=int(parts[3]) if len(parts)>3 and parts[3].lstrip('-').isdigit() else -1
+    con=db(); con.execute("INSERT INTO products(name,price,description,stock) VALUES(?,?,?,?)",(name,price,desc,stock)); con.commit(); con.close()
+    await update.message.reply_text(f"✅ Produk *{name}* berhasil ditambahkan.",parse_mode="Markdown")
 
 async def admin_photo(update,context):
     uid=update.effective_user.id; caption=(update.message.caption or "").strip()
     if uid in ADMIN_IDS and caption.lower().startswith("/add"):
         parts=[x.strip() for x in caption.partition(" ")[2].strip().split("|")]
-        if len(parts)<2: await update.message.reply_text("❌ Format: /add Nama | Harga | Deskripsi"); return
-        name,price=parts[0],parts[1]; desc=parts[2] if len(parts)>2 else ""; photo_id=update.message.photo[-1].file_id
-        con=db(); con.execute("INSERT INTO products(name,price,description,photo) VALUES(?,?,?,?)",(name,price,desc,photo_id)); con.commit(); con.close(); await update.message.reply_text(f"✅ Produk *{name}* + foto berhasil ditambahkan.",parse_mode="Markdown"); return
+        if len(parts)<2: await update.message.reply_text("❌ Format: `/add Nama | Harga | Deskripsi | Stok`", parse_mode="Markdown"); return
+        name,price=parts[0],parts[1]; desc=parts[2] if len(parts)>2 else ""
+        stock=int(parts[3]) if len(parts)>3 and parts[3].lstrip('-').isdigit() else -1
+        photo_id=update.message.photo[-1].file_id
+        con=db(); con.execute("INSERT INTO products(name,price,description,photo,stock) VALUES(?,?,?,?,?)",(name,price,desc,photo_id,stock)); con.commit(); con.close()
+        await update.message.reply_text(f"✅ Produk *{name}* + foto berhasil ditambahkan.",parse_mode="Markdown"); return
 
     match=re.search(r"ORD-(\d+)",caption.upper())
     if not match: await update.message.reply_text("📸 Caption bukti wajib berisi ID seperti `ORD-00001`.",parse_mode="Markdown"); return
@@ -367,16 +358,55 @@ async def admin_photo(update,context):
 async def show_chat_id(update,context):
     if update.effective_chat.type in ("group","supergroup"):
         await update.message.reply_text(
-            f"🆔 *ID Grup Ini:*\\n`{update.effective_chat.id}`\\n\\n"
+            f"🆔 *ID Grup Ini:*\n`{update.effective_chat.id}`\n\n"
             "Masukkan angka ini ke Railway → Variables → `ADMIN_GROUP_ID`.",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
-            f"🆔 Chat ID kamu: `{update.effective_chat.id}`\\n\\n"
+            f"🆔 Chat ID kamu: `{update.effective_chat.id}`\n\n"
             "Jalankan /id di grup admin untuk mendapatkan ADMIN_GROUP_ID.",
             parse_mode="Markdown"
         )
+
+async def admin_broadcast(update, context):
+    if update.effective_user.id not in ADMIN_IDS: return
+    msg = update.message.text.partition(" ")[2].strip()
+    if not msg:
+        await update.message.reply_text("Format: `/bc Pesan broadcast kamu`", parse_mode="Markdown")
+        return
+    con = db()
+    users = con.execute("SELECT user_id FROM users").fetchall()
+    con.close()
+    
+    success, fail = 0, 0
+    for u in users:
+        try:
+            await context.bot.send_message(u[0], f"📢 *PENGUMUMAN*\n\n{msg}", parse_mode="Markdown")
+            success += 1
+        except Exception:
+            fail += 1
+    await update.message.reply_text(f"📢 *Broadcast Selesai*\n\n✅ Berhasil: `{success}`\n❌ Gagal: `{fail}`", parse_mode="Markdown")
+
+async def check_order_cmd(update, context):
+    raw = update.message.text.partition(" ")[2].strip()
+    match = re.search(r"(\d+)", raw)
+    if not match:
+        await update.message.reply_text("Format: `/cek ORD-00001`", parse_mode="Markdown")
+        return
+    oid = int(match.group(1))
+    con = db()
+    row = con.execute("SELECT o.id, o.user_id, p.name, p.price, o.status FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=?", (oid,)).fetchone()
+    con.close()
+    if not row:
+        await update.message.reply_text("❌ Order tidak ditemukan.")
+        return
+    text = f"🔍 *DETAIL PESANAN*\n\n🆔 `ORD-{row[0]:05d}`\n👤 User ID: `{row[1]}`\n📦 Produk: {row[2]}\n💰 Harga: {row[3]}\n📌 Status: *{STATUS_TEXT.get(row[4], row[4])}*"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def admin_stats_cmd(update, context):
+    if update.effective_user.id not in ADMIN_IDS: return
+    await send_admin_stats(update.effective_user.id, context)
 
 async def admin_products(update,context):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -392,9 +422,11 @@ async def admin_delete(update,context):
 async def admin_edit(update,context):
     if update.effective_user.id not in ADMIN_IDS: return
     parts=[x.strip() for x in update.message.text.partition(" ")[2].strip().split("|")]
-    if len(parts)<3 or not parts[0].isdigit(): await update.message.reply_text("Format: /edit ID | Nama | Harga | Deskripsi"); return
+    if len(parts)<3 or not parts[0].isdigit(): await update.message.reply_text("Format: `/edit ID | Nama | Harga | Deskripsi | Stok`", parse_mode="Markdown"); return
     pid=int(parts[0]); name=parts[1]; price=parts[2]; desc=parts[3] if len(parts)>3 else ""
-    con=db(); cur=con.execute("UPDATE products SET name=?,price=?,description=? WHERE id=?",(name,price,desc,pid)); con.commit(); con.close(); await update.message.reply_text("✏️ Produk berhasil diedit." if cur.rowcount else "❌ Produk tidak ditemukan.")
+    stock=int(parts[4]) if len(parts)>4 and parts[4].lstrip('-').isdigit() else -1
+    con=db(); cur=con.execute("UPDATE products SET name=?,price=?,description=?,stock=? WHERE id=?",(name,price,desc,stock,pid)); con.commit(); con.close()
+    await update.message.reply_text("✏️ Produk berhasil diedit." if cur.rowcount else "❌ Produk tidak ditemukan.")
 
 async def admin_setpayment(update,context):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -417,6 +449,11 @@ def main():
     app.add_handler(CommandHandler("setpayment",admin_setpayment))
     app.add_handler(CommandHandler("admin",adminpanel))
     app.add_handler(CommandHandler("id",show_chat_id))
-    app.add_handler(MessageHandler(filters.PHOTO,admin_photo)); app.add_handler(CallbackQueryHandler(callback)); app.run_polling()
+    app.add_handler(CommandHandler("bc",admin_broadcast))
+    app.add_handler(CommandHandler("stats",admin_stats_cmd))
+    app.add_handler(CommandHandler("cek",check_order_cmd))
+    app.add_handler(MessageHandler(filters.PHOTO,admin_photo))
+    app.add_handler(CallbackQueryHandler(callback))
+    app.run_polling()
 
 if __name__=="__main__": main()
