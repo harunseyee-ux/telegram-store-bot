@@ -1,132 +1,202 @@
-import os, sqlite3, logging, re
+import os, sqlite3, logging, re, shutil, zipfile
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
-TOKEN = os.getenv("BOT_TOKEN", "")
-REQUIRED_CHAT = os.getenv("REQUIRED_CHAT", "")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID", "").strip()
-PAYMENT_INFO = os.getenv("PAYMENT_INFO", "Hubungi admin untuk info pembayaran.")
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")
-DB = "store.db"
+TOKEN = os.getenv('BOT_TOKEN', '')
+REQUIRED_CHAT = os.getenv('REQUIRED_CHAT', '')
+ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}
+ADMIN_GROUP_ID = os.getenv('ADMIN_GROUP_ID', '').strip()
+SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', '')
+DB = 'store.db'
 
 logging.basicConfig(level=logging.INFO)
 
 STATUS_TEXT = {
-    "pending_payment": "Menunggu pembayaran",
-    "proof_received": "Bukti diterima",
-    "processing": "Sedang diproses",
-    "paid": "Pembayaran dikonfirmasi",
-    "rejected": "Ditolak",
-    "completed": "Selesai",
+    'pending_payment': 'Menunggu pembayaran',
+    'proof_received': 'Bukti diterima',
+    'processing': 'Sedang diproses',
+    'paid': 'Pembayaran dikonfirmasi',
+    'rejected': 'Ditolak',
+    'completed': 'Selesai',
 }
 
 
 def db():
-    con = sqlite3.connect(DB)
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
 
-    con.execute("""
+    c.execute('''
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    ''')
 
-    con.execute("""
+    c.execute('''
         CREATE TABLE IF NOT EXISTS products(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             price TEXT NOT NULL,
             description TEXT DEFAULT '',
             photo TEXT DEFAULT '',
-            stock INTEGER DEFAULT -1
+            stock INTEGER DEFAULT -1,
+            delivery_text TEXT DEFAULT '',
+            delivery_file_id TEXT DEFAULT ''
         )
-    """)
+    ''')
 
-    try:
-        con.execute("ALTER TABLE products ADD COLUMN stock INTEGER DEFAULT -1")
-    except Exception:
-        pass
-
-    con.execute("""
+    c.execute('''
         CREATE TABLE IF NOT EXISTS orders(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             product_id INTEGER,
             status TEXT DEFAULT 'pending_payment',
+            quantity INTEGER DEFAULT 1,
+            total_price TEXT DEFAULT '',
+            voucher_code TEXT DEFAULT '',
+            payment_method TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    ''')
 
-    con.execute("""
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS cart(
+            user_id INTEGER,
+            product_id INTEGER,
+            quantity INTEGER DEFAULT 1,
+            PRIMARY KEY(user_id,product_id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS vouchers(
+            code TEXT PRIMARY KEY,
+            discount_percent INTEGER DEFAULT 0,
+            stock INTEGER DEFAULT -1,
+            active INTEGER DEFAULT 1
+        )
+    ''')
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
             value TEXT DEFAULT ''
         )
-    """)
+    ''')
 
-    # V2: keranjang
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS cart(
-            user_id INTEGER,
-            product_id INTEGER,
-            qty INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY(user_id, product_id)
-        )
-    """)
+    for sql in [
+        "ALTER TABLE products ADD COLUMN delivery_text TEXT DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN delivery_file_id TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN quantity INTEGER DEFAULT 1",
+        "ALTER TABLE orders ADD COLUMN total_price TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN voucher_code TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT ''",
+    ]:
+        try:
+            c.execute(sql)
+        except sqlite3.OperationalError:
+            pass
 
-    # V2: item-item dalam satu order
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS order_items(
-            order_id INTEGER,
-            product_id INTEGER,
-            qty INTEGER NOT NULL,
-            price TEXT,
-            name TEXT
-        )
-    """)
-
-    con.commit()
-    return con
+    c.commit()
+    return c
 
 
-def get_payment():
-    con = db()
-    row = con.execute(
-        "SELECT value FROM settings WHERE key='payment_info'"
+def setting(k, default=''):
+    c = db()
+
+    r = c.execute(
+        'SELECT value FROM settings WHERE key=?',
+        (k,)
     ).fetchone()
-    con.close()
 
-    return row[0] if row and row[0] else PAYMENT_INFO
+    c.close()
+
+    return r['value'] if r and r['value'] else default
 
 
-def set_payment(value):
-    con = db()
-    con.execute("""
+def set_setting(k, v):
+    c = db()
+
+    c.execute(
+        '''
         INSERT INTO settings(key,value)
-        VALUES('payment_info',?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (value,))
-    con.commit()
-    con.close()
+        VALUES(?,?)
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value
+        ''',
+        (k, v)
+    )
+
+    c.commit()
+    c.close()
 
 
-def menu():
+def store_name():
+    return setting('store_name', 'My Store')
+
+
+def payment_value(method):
+    return setting(
+        f'payment_{method.lower()}',
+        ''
+    )
+
+
+def money_number(value):
+    try:
+        return int(
+            re.sub(
+                r'[^0-9]',
+                '',
+                str(value)
+            ) or 0
+        )
+    except Exception:
+        return 0
+
+
+def format_money(value):
+    try:
+        return f"Rp{int(value):,}".replace(',', '.')
+    except Exception:
+        return str(value)
+
+
+def main_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🛒 Katalog", callback_data="catalog"),
-            InlineKeyboardButton("🔎 Cari", callback_data="search")
+            InlineKeyboardButton(
+                '🛒 Katalog',
+                callback_data='catalog'
+            ),
+            InlineKeyboardButton(
+                '🔎 Cari',
+                callback_data='search'
+            )
         ],
         [
-            InlineKeyboardButton("🧺 Keranjang", callback_data="cart")
+            InlineKeyboardButton(
+                '🧺 Keranjang',
+                callback_data='cart'
+            )
         ],
         [
-            InlineKeyboardButton("📦 Pesanan Saya", callback_data="orders"),
-            InlineKeyboardButton("💳 Pembayaran", callback_data="payment")
+            InlineKeyboardButton(
+                '📦 Pesanan Saya',
+                callback_data='orders'
+            ),
+            InlineKeyboardButton(
+                '💳 Pembayaran',
+                callback_data='payment'
+            )
         ],
         [
-            InlineKeyboardButton("👨‍💻 Contact Admin", callback_data="support")
+            InlineKeyboardButton(
+                '👨‍💻 Contact Admin',
+                callback_data='support'
+            )
         ]
     ])
 
@@ -135,87 +205,153 @@ def admin_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🛒 Kelola Produk",
-                callback_data="adminlist"
+                '🛒 Produk',
+                callback_data='adminlist'
+            ),
+            InlineKeyboardButton(
+                '📦 Order',
+                callback_data='adminorders'
             )
         ],
         [
             InlineKeyboardButton(
-                "📦 Kelola Pesanan",
-                callback_data="adminorders"
+                '💳 Metode Pembayaran',
+                callback_data='adminpayment'
             )
         ],
         [
             InlineKeyboardButton(
-                "📊 Statistik Toko",
-                callback_data="adminstats"
+                '🏪 Nama Store',
+                callback_data='adminstore'
             )
         ],
         [
             InlineKeyboardButton(
-                "💳 Edit Payment",
-                callback_data="adminpayment"
+                '💾 Backup Data',
+                callback_data='backup'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '📊 Statistik',
+                callback_data='adminstats'
             )
         ]
     ])
 
 
-def order_buttons(oid, include_payment=True):
-    rows = []
-
-    if include_payment:
-        rows.append([
-            InlineKeyboardButton(
-                "💳 INFO PEMBAYARAN",
-                callback_data=f"payorder:{oid}"
-            )
-        ])
-
-    rows.append([
-        InlineKeyboardButton(
-            "📤 CARA KIRIM BUKTI",
-            callback_data=f"proofhelp:{oid}"
-        )
-    ])
-
-    rows.append([
-        InlineKeyboardButton(
-            "⬅️ Menu",
-            callback_data="home"
-        )
-    ])
-
-    return InlineKeyboardMarkup(rows)
-
-
-def admin_order_buttons(oid):
+def payment_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "⚙️ PROSES",
-                callback_data=f"setstatus:processing:{oid}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✅ APPROVED",
-                callback_data=f"setstatus:paid:{oid}"
+                '💙 DANA',
+                callback_data='paymethod:DANA'
             ),
             InlineKeyboardButton(
-                "❌ REJECTED",
-                callback_data=f"setstatus:rejected:{oid}"
+                '💚 GO-PAY',
+                callback_data='paymethod:GOPAY'
             )
         ],
         [
             InlineKeyboardButton(
-                "🏁 SELESAI",
-                callback_data=f"setstatus:completed:{oid}"
+                '🟦 QRIS',
+                callback_data='paymethod:QRIS'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '⬅️ Kembali',
+                callback_data='home'
             )
         ]
     ])
 
 
-async def is_joined(update, context):
+def admin_payment_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                '💙 Atur DANA',
+                callback_data='setpay:DANA'
+            ),
+            InlineKeyboardButton(
+                '💚 Atur GO-PAY',
+                callback_data='setpay:GOPAY'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '🟦 Upload QRIS',
+                callback_data='uploadqris'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '⬅️ Admin Panel',
+                callback_data='adminhome'
+            )
+        ]
+    ])
+
+
+def order_admin_buttons(oid):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                '⚙️ PROSES',
+                callback_data=f'setstatus:processing:{oid}'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '✅ APPROVED',
+                callback_data=f'setstatus:paid:{oid}'
+            ),
+            InlineKeyboardButton(
+                '❌ REJECT',
+                callback_data=f'setstatus:rejected:{oid}'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '🏁 SELESAI',
+                callback_data=f'setstatus:completed:{oid}'
+            )
+        ]
+    ])
+
+
+def order_user_buttons(oid):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                '💳 Pilih Pembayaran',
+                callback_data=f'choosepay:{oid}'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '📤 Kirim Bukti Pembayaran',
+                callback_data=f'proofhelp:{oid}'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '⬅️ Menu',
+                callback_data='home'
+            )
+        ]
+    ])
+
+
+async def safe_delete(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def joined(update, context):
     if not REQUIRED_CHAT:
         return True
 
@@ -226,28 +362,17 @@ async def is_joined(update, context):
         )
 
         return member.status in (
-            "member",
-            "administrator",
-            "creator"
+            'member',
+            'administrator',
+            'creator'
         )
 
     except Exception:
         return False
 
 
-async def safe_delete(message):
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-
-# =========================================================
-# FIX /START
-# =========================================================
-
-async def replace_menu(chat_id, context, text="🔥 *Menu Utama*"):
-    old_id = context.user_data.get("last_menu_id")
+async def replace_home(chat_id, context, text=None):
+    old_id = context.user_data.get('last_menu_id')
 
     if old_id:
         try:
@@ -258,95 +383,75 @@ async def replace_menu(chat_id, context, text="🔥 *Menu Utama*"):
         except Exception:
             pass
 
+    text = text or (
+        f'🔥 *{store_name()}*\n\n'
+        'Selamat datang! Pilih menu di bawah.'
+    )
+
     msg = await context.bot.send_message(
         chat_id,
         text,
-        parse_mode="Markdown",
-        reply_markup=menu()
+        parse_mode='Markdown',
+        reply_markup=main_menu()
     )
 
-    context.user_data["last_menu_id"] = msg.message_id
+    context.user_data['last_menu_id'] = msg.message_id
+
     return msg
-
-
-async def send_home(
-    chat_id,
-    context,
-    text="🔥 *Menu Utama*"
-):
-    return await replace_menu(chat_id, context, text)
 
 
 async def start(update, context):
     uid = update.effective_user.id
-    uname = update.effective_user.username or ""
+    username = update.effective_user.username or ''
 
-    con = db()
+    c = db()
 
-    con.execute("""
-        INSERT INTO users(user_id, username)
+    c.execute(
+        '''
+        INSERT INTO users(user_id,username)
         VALUES(?,?)
         ON CONFLICT(user_id)
         DO UPDATE SET username=excluded.username
-    """, (uid, uname))
+        ''',
+        (uid, username)
+    )
 
-    con.commit()
-    con.close()
+    c.commit()
+    c.close()
 
-    # Telegram tidak selalu mengizinkan bot menghapus
-    # command user. Jadi jangan bergantung pada itu.
     await safe_delete(update.message)
 
-    old_id = context.user_data.get("last_menu_id")
-
-    if old_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=uid,
-                message_id=old_id
-            )
-        except Exception:
-            pass
-
-    if not await is_joined(update, context):
+    if not await joined(update, context):
         kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    "🔗 JOIN GRUP",
+                    '🔗 JOIN GRUP',
                     url=f"https://t.me/{REQUIRED_CHAT.lstrip('@')}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "✅ SUDAH JOIN",
-                    callback_data="check_join"
+                    '✅ SUDAH JOIN',
+                    callback_data='checkjoin'
                 )
             ]
         ])
 
         msg = await context.bot.send_message(
             uid,
-            "🔒 *Akses dikunci*\n\n"
-            "Join grup wajib terlebih dahulu, "
-            "lalu tekan *SUDAH JOIN*.",
-            parse_mode="Markdown",
+            (
+                f'🔒 *{store_name()}*\n\n'
+                'Silakan join grup terlebih dahulu.'
+            ),
+            parse_mode='Markdown',
             reply_markup=kb
         )
 
-        context.user_data["last_menu_id"] = msg.message_id
+        context.user_data['last_menu_id'] = msg.message_id
         return
 
-    await replace_menu(
-        uid,
-        context,
-        "🔥 *Selamat datang di Store!*\n"
-        "Pilih menu di bawah."
-    )
+    await replace_home(uid, context)
 
-
-# =========================================================
-# ADMIN NOTIFICATION
-# =========================================================
 
 async def notify_admins(
     context,
@@ -354,31 +459,27 @@ async def notify_admins(
     reply_markup=None,
     photo=None
 ):
-    sent = []
-
     for admin_id in ADMIN_IDS:
         try:
             if photo:
-                msg = await context.bot.send_photo(
+                await context.bot.send_photo(
                     admin_id,
                     photo=photo,
                     caption=text,
-                    parse_mode="Markdown",
+                    parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
             else:
-                msg = await context.bot.send_message(
+                await context.bot.send_message(
                     admin_id,
                     text,
-                    parse_mode="Markdown",
+                    parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
-
-            sent.append(msg)
-
         except Exception:
             logging.exception(
-                "Private admin notification failed"
+                'Failed notifying admin %s',
+                admin_id
             )
 
     if ADMIN_GROUP_ID:
@@ -388,179 +489,142 @@ async def notify_admins(
                     ADMIN_GROUP_ID,
                     photo=photo,
                     caption=text,
-                    parse_mode="Markdown",
+                    parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
             else:
                 await context.bot.send_message(
                     ADMIN_GROUP_ID,
                     text,
-                    parse_mode="Markdown",
+                    parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
-
         except Exception:
             logging.exception(
-                "Admin group notification failed"
+                'Failed notifying admin group'
             )
 
-    return sent
+
+def cart_items(uid):
+    c = db()
+
+    rows = c.execute(
+        '''
+        SELECT
+            c.product_id,
+            c.quantity,
+            p.name,
+            p.price,
+            p.stock,
+            p.description,
+            p.photo,
+            p.delivery_text,
+            p.delivery_file_id
+        FROM cart c
+        JOIN products p
+          ON p.id=c.product_id
+        WHERE c.user_id=?
+        ORDER BY p.id DESC
+        ''',
+        (uid,)
+    ).fetchall()
+
+    c.close()
+
+    return rows
 
 
-# =========================================================
-# CART
-# =========================================================
-
-def stock_ok(con, pid, qty):
-    row = con.execute(
-        "SELECT stock FROM products WHERE id=?",
+def product_available(c, pid, quantity):
+    row = c.execute(
+        'SELECT stock FROM products WHERE id=?',
         (pid,)
     ).fetchone()
 
     if not row:
         return False
 
-    stock = row[0]
+    stock = row['stock']
 
-    return stock < 0 or stock >= qty
-
-
-def cart_rows(uid):
-    con = db()
-
-    rows = con.execute("""
-        SELECT
-            c.product_id,
-            c.qty,
-            p.name,
-            p.price,
-            p.stock,
-            p.photo,
-            p.description
-        FROM cart c
-        JOIN products p
-            ON p.id=c.product_id
-        WHERE c.user_id=?
-        ORDER BY p.id DESC
-    """, (uid,)).fetchall()
-
-    con.close()
-
-    return rows
+    return stock < 0 or stock >= quantity
 
 
-def price_num(value):
-    try:
-        return int(
-            re.sub(
-                r"[^0-9]",
-                "",
-                str(value)
-            ) or 0
-        )
-    except Exception:
-        return 0
-
-
-def cart_text(rows, discount=0):
-    if not rows:
-        return "🧺 *Keranjang kosong.*"
-
-    total = sum(
-        price_num(row[3]) * row[1]
-        for row in rows
-    )
-
-    final = max(0, total - discount)
-
-    text = "🧺 *KERANJANG*\n\n"
-
-    text += "\n".join(
-        f"• {row[2]} × {row[1]} — {row[3]}"
-        for row in rows
-    )
-
-    text += (
-        f"\n\n💰 Subtotal: `{total}`"
-        f"\n🎟️ Diskon: `{discount}`"
-        f"\n💳 Total: `{final}`"
-    )
-
-    return text
-
-
-def cart_kb(rows):
+def cart_keyboard(rows):
     kb = []
 
     for row in rows:
         kb.append([
             InlineKeyboardButton(
-                f"➖ {row[2]}",
-                callback_data=f"cartminus:{row[0]}"
+                '➖',
+                callback_data=f'cartminus:{row["product_id"]}'
             ),
             InlineKeyboardButton(
-                f"{row[1]} pcs",
-                callback_data="noop"
+                f'{row["name"]} × {row["quantity"]}',
+                callback_data='noop'
             ),
             InlineKeyboardButton(
-                f"➕ {row[2]}",
-                callback_data=f"cartplus:{row[0]}"
+                '➕',
+                callback_data=f'cartplus:{row["product_id"]}'
+            )
+        ])
+
+    if rows:
+        kb.append([
+            InlineKeyboardButton(
+                '🗑️ Kosongkan',
+                callback_data='cartclear'
+            ),
+            InlineKeyboardButton(
+                '💳 Checkout',
+                callback_data='checkout'
             )
         ])
 
     kb.append([
         InlineKeyboardButton(
-            "🗑️ Kosongkan",
-            callback_data="cartclear"
-        ),
-        InlineKeyboardButton(
-            "⚡ CHECKOUT",
-            callback_data="checkout"
-        )
-    ])
-
-    kb.append([
-        InlineKeyboardButton(
-            "⬅️ Menu",
-            callback_data="home"
+            '⬅️ Menu',
+            callback_data='home'
         )
     ])
 
     return InlineKeyboardMarkup(kb)
 
 
-async def show_cart(
-    uid,
-    context,
-    message=None
-):
-    rows = cart_rows(uid)
+def cart_text(rows):
+    if not rows:
+        return '🧺 *Keranjang masih kosong.*'
+
+    total = 0
+    lines = []
+
+    for row in rows:
+        price = money_number(row['price'])
+        subtotal = price * row['quantity']
+        total += subtotal
+
+        lines.append(
+            f'• {row["name"]} × {row["quantity"]} '
+            f'— {format_money(subtotal)}'
+        )
+
+    return (
+        '🧺 *KERANJANG*\n\n'
+        + '\n'.join(lines)
+        + f'\n\n💰 *Total:* {format_money(total)}'
+    )
+
+
+async def show_cart(update, context):
+    uid = update.effective_user.id
+    rows = cart_items(uid)
 
     text = cart_text(rows)
+    kb = cart_keyboard(rows)
 
-    if rows:
-        kb = cart_kb(rows)
-    else:
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🛒 Katalog",
-                    callback_data="catalog"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Menu",
-                    callback_data="home"
-                )
-            ]
-        ])
-
-    if message:
+    if update.callback_query:
         try:
-            await message.edit_text(
+            await update.callback_query.message.edit_text(
                 text,
-                parse_mode="Markdown",
+                parse_mode='Markdown',
                 reply_markup=kb
             )
             return
@@ -570,2138 +634,1735 @@ async def show_cart(
     await context.bot.send_message(
         uid,
         text,
-        parse_mode="Markdown",
+        parse_mode='Markdown',
         reply_markup=kb
     )
 
 
-# =========================================================
-# ORDER CREATION
-# =========================================================
+def create_single_order(uid, pid):
+    c = db()
 
-async def create_order(uid, context, rows):
-    con = db()
+    product = c.execute(
+        '''
+        SELECT *
+        FROM products
+        WHERE id=?
+        ''',
+        (pid,)
+    ).fetchone()
 
-    for row in rows:
-        pid = row[0]
-        qty = row[1]
+    if not product:
+        c.close()
+        return None, 'Produk tidak ditemukan.'
 
-        if not stock_ok(con, pid, qty):
-            con.close()
-            return None, "Stok produk tidak cukup."
+    if product['stock'] == 0:
+        c.close()
+        return None, 'Stok produk habis.'
 
-    cur = con.execute(
-        """
+    if product['stock'] > 0:
+        c.execute(
+            '''
+            UPDATE products
+            SET stock=stock-1
+            WHERE id=?
+            ''',
+            (pid,)
+        )
+
+    cur = c.execute(
+        '''
         INSERT INTO orders(
             user_id,
             product_id,
+            quantity,
+            total_price,
             status
         )
-        VALUES(?,?,?)
-        """,
+        VALUES(?,?,?,?,?)
+        ''',
         (
             uid,
-            rows[0][0],
-            "pending_payment"
+            pid,
+            1,
+            product['price'],
+            'pending_payment'
+        )
+    )
+
+    oid = cur.lastrowid
+
+    c.commit()
+    c.close()
+
+    return oid, None
+
+
+def create_cart_order(uid):
+    c = db()
+
+    rows = c.execute(
+        '''
+        SELECT
+            c.product_id,
+            c.quantity,
+            p.name,
+            p.price,
+            p.stock
+        FROM cart c
+        JOIN products p
+          ON p.id=c.product_id
+        WHERE c.user_id=?
+        ''',
+        (uid,)
+    ).fetchall()
+
+    if not rows:
+        c.close()
+        return None, 'Keranjang kosong.'
+
+    for row in rows:
+        if not product_available(
+            c,
+            row['product_id'],
+            row['quantity']
+        ):
+            c.close()
+            return None, (
+                f'Stok {row["name"]} tidak cukup.'
+            )
+
+    first = rows[0]
+
+    total = sum(
+        money_number(row['price']) * row['quantity']
+        for row in rows
+    )
+
+    if len(rows) == 1:
+        product_id = first['product_id']
+        quantity = first['quantity']
+    else:
+        product_id = first['product_id']
+        quantity = sum(
+            row['quantity']
+            for row in rows
+        )
+
+    cur = c.execute(
+        '''
+        INSERT INTO orders(
+            user_id,
+            product_id,
+            quantity,
+            total_price,
+            status
+        )
+        VALUES(?,?,?,?,?)
+        ''',
+        (
+            uid,
+            product_id,
+            quantity,
+            format_money(total),
+            'pending_payment'
         )
     )
 
     oid = cur.lastrowid
 
     for row in rows:
-        pid = row[0]
-        qty = row[1]
-        name = row[2]
-        price = row[3]
-        stock = row[4]
-
-        con.execute(
-            """
-            INSERT INTO order_items(
-                order_id,
-                product_id,
-                qty,
-                price,
-                name
-            )
-            VALUES(?,?,?,?,?)
-            """,
-            (
-                oid,
-                pid,
-                qty,
-                price,
-                name
-            )
-        )
-
-        if stock > 0:
-            con.execute(
-                """
+        if row['stock'] > 0:
+            c.execute(
+                '''
                 UPDATE products
                 SET stock=stock-?
                 WHERE id=?
-                """,
-                (qty, pid)
+                ''',
+                (
+                    row['quantity'],
+                    row['product_id']
+                )
             )
 
-    con.execute(
-        "DELETE FROM cart WHERE user_id=?",
+    c.execute(
+        'DELETE FROM cart WHERE user_id=?',
         (uid,)
     )
 
-    con.commit()
-    con.close()
+    c.commit()
+    c.close()
 
     return oid, None
 
 
-async def send_order_created(
+async def order_info(
     uid,
     context,
     oid
 ):
-    con = db()
+    c = db()
 
-    rows = con.execute(
-        """
-        SELECT name,qty,price
-        FROM order_items
-        WHERE order_id=?
-        """,
+    row = c.execute(
+        '''
+        SELECT
+            o.id,
+            o.user_id,
+            o.product_id,
+            o.quantity,
+            o.total_price,
+            o.status,
+            o.payment_method,
+            o.created_at,
+            p.name,
+            p.price
+        FROM orders o
+        JOIN products p
+          ON p.id=o.product_id
+        WHERE o.id=?
+        ''',
         (oid,)
-    ).fetchall()
+    ).fetchone()
 
-    con.close()
+    c.close()
 
-    total = sum(
-        price_num(row[2]) * row[1]
-        for row in rows
-    )
+    if not row:
+        return
 
-    products = "\n".join(
-        f"• {row[0]} × {row[1]} — {row[2]}"
-        for row in rows
+    username = (
+        context.user_data.get('username')
+        or ''
     )
 
     text = (
-        "🧾 *ORDER BERHASIL DIBUAT*\n\n"
-        f"🆔 ID Transaksi: `ORD-{oid:05d}`\n"
-        f"📦 Produk:\n{products}\n"
-        f"💰 Total: `{total}`\n"
-        "📌 Status: Menunggu pembayaran\n\n"
-        "💳 *Pembayaran:*\n"
-        f"{get_payment()}\n\n"
-        "Setelah bayar, kirim *foto bukti pembayaran* "
-        "ke chat bot ini.\n"
-        f"Tulis `ORD-{oid:05d}` di caption foto."
+        f'🧾 *ORDER {store_name()}*\n\n'
+        f'🆔 No. Transaksi: `ORD-{row["id"]:05d}`\n'
+        f'📦 Produk: {row["name"]}\n'
+        f'🔢 Qty: {row["quantity"]}\n'
+        f'💰 Total: {row["total_price"] or row["price"]}\n'
+        f'📌 Status: '
+        f'*{STATUS_TEXT.get(row["status"], row["status"])}*\n'
+        f'🕐 Tanggal: {row["created_at"]}'
     )
 
     await context.bot.send_message(
         uid,
         text,
-        parse_mode="Markdown",
-        reply_markup=order_buttons(oid)
-    )
-
-    await notify_admins(
-        context,
-        (
-            "🔔 *PESANAN BARU*\n\n"
-            f"🆔 `ORD-{oid:05d}`\n"
-            f"👤 User ID: `{uid}`\n"
-            f"📦\n{products}\n"
-            f"💰 Total: `{total}`\n"
-            "📌 Status: Menunggu pembayaran"
-        ),
-        admin_order_buttons(oid)
+        parse_mode='Markdown',
+        reply_markup=order_user_buttons(oid)
     )
 
 
-def order_items_text(oid):
-    con = db()
+async def catalog(update, context):
+    c = db()
 
-    rows = con.execute(
-        """
-        SELECT name,qty
-        FROM order_items
-        WHERE order_id=?
-        """,
-        (oid,)
+    rows = c.execute(
+        '''
+        SELECT *
+        FROM products
+        ORDER BY id DESC
+        '''
     ).fetchall()
 
-    con.close()
+    c.close()
 
-    return ", ".join(
-        f"{name} × {qty}"
-        for name, qty in rows
-    )
-
-
-async def deliver_order(
-    oid,
-    uid,
-    context
-):
-    """
-    Delivery digital memakai Description produk.
-    Jadi untuk sementara isi Description dengan
-    konten/file-link produk digital.
-    """
-
-    con = db()
-
-    rows = con.execute(
-        """
-        SELECT product_id,name,qty
-        FROM order_items
-        WHERE order_id=?
-        """,
-        (oid,)
-    ).fetchall()
-
-    con.close()
-
-    delivered = False
-
-    for pid, name, qty in rows:
-        con = db()
-
-        product = con.execute(
-            """
-            SELECT description
-            FROM products
-            WHERE id=?
-            """,
-            (pid,)
-        ).fetchone()
-
-        con.close()
-
-        if product and product[0]:
-            await context.bot.send_message(
-                uid,
-                (
-                    f"🎁 *DELIVERY* — {name}\n\n"
-                    f"{product[0]}"
-                ),
-                parse_mode="Markdown"
-            )
-
-            delivered = True
-
-    if delivered:
-        await context.bot.send_message(
-            uid,
-            (
-                f"✅ *Order ORD-{oid:05d} "
-                "sudah approved.*\n\n"
-                "Produk digital sudah dikirim."
-            ),
-            parse_mode="Markdown"
-        )
+    if not rows:
+        text = '🛒 *KATALOG*\n\nBelum ada produk.'
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Menu', callback_data='home')]
+        ])
     else:
-        await context.bot.send_message(
-            uid,
-            (
-                f"✅ *Order ORD-{oid:05d} "
-                "sudah approved.*\n\n"
-                "Silakan tunggu proses pengiriman "
-                "dari admin."
-            ),
-            parse_mode="Markdown"
-        )
+        text = f'🛒 *KATALOG {store_name()}*\n\n'
+        buttons = []
 
-
-# =========================================================
-# CALLBACK
-# =========================================================
-
-async def callback(update, context):
-    q = update.callback_query
-    data = q.data
-
-    if data == "noop":
-        await q.answer()
-        return
-
-    await q.answer()
-
-    if data == "check_join":
-        if await is_joined(update, context):
-            await safe_delete(q.message)
-
-            await send_home(
-                update.effective_user.id,
-                context,
-                "✅ *Verifikasi berhasil!*\n\n"
-                "Selamat datang di Store 🔥"
-            )
-        else:
-            await q.answer(
-                "❌ Kamu belum join grup!",
-                show_alert=True
+        for row in rows:
+            stock = (
+                '∞'
+                if row['stock'] < 0
+                else str(row['stock'])
             )
 
-        return
+            text += (
+                f'📦 *{row["name"]}*\n'
+                f'💰 {row["price"]}\n'
+                f'📦 Stok: {stock}\n'
+            )
 
-    if not await is_joined(update, context):
-        await q.answer(
-            "❌ Join grup wajib dulu.",
+            if row['description']:
+                text += f'_{row["description"]}_\n'
+
+            text += '\n'
+
+            buttons.append([
+                InlineKeyboardButton(
+                    f'🛒 {row["name"]}',
+                    callback_data=f'product:{row["id"]}'
+                )
+            ])
+
+        buttons.append([
+            InlineKeyboardButton(
+                '⬅️ Menu',
+                callback_data='home'
+            )
+        ])
+
+        kb = InlineKeyboardMarkup(buttons)
+
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(
+                text,
+                parse_mode='Markdown',
+                reply_markup=kb
+            )
+            return
+        except Exception:
+            pass
+
+    await context.bot.send_message(
+        update.effective_user.id,
+        text,
+        parse_mode='Markdown',
+        reply_markup=kb
+    )
+
+
+async def product_detail(update, context, pid):
+    c = db()
+
+    row = c.execute(
+        'SELECT * FROM products WHERE id=?',
+        (pid,)
+    ).fetchone()
+
+    c.close()
+
+    if not row:
+        await update.callback_query.answer(
+            'Produk tidak ditemukan.',
             show_alert=True
         )
         return
 
-    uid = update.effective_user.id
+    stock = (
+        '∞'
+        if row['stock'] < 0
+        else str(row['stock'])
+    )
 
-    # HOME
-    if data == "home":
-        await safe_delete(q.message)
-        await send_home(uid, context)
-        return
+    text = (
+        f'📦 *{row["name"]}*\n\n'
+        f'💰 Harga: *{row["price"]}*\n'
+        f'📦 Stok: *{stock}*\n\n'
+        f'{row["description"] or "Tidak ada deskripsi."}'
+    )
 
-    # KATALOG
-    if data == "catalog":
-        con = db()
-
-        rows = con.execute(
-            """
-            SELECT id,name,price,stock
-            FROM products
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-        con.close()
-
-        await safe_delete(q.message)
-
-        if not rows:
-            await context.bot.send_message(
-                uid,
-                "📭 Katalog masih kosong.",
-                reply_markup=menu()
-            )
-            return
-
-        kb = []
-
-        for row in rows:
-            stock_text = (
-                "∞"
-                if row[3] < 0
-                else str(row[3])
-            )
-
-            kb.append([
-                InlineKeyboardButton(
-                    (
-                        f"🛍️ {row[1]} • {row[2]} "
-                        f"(Stok: {stock_text})"
-                    ),
-                    callback_data=f"product:{row[0]}"
-                )
-            ])
-
-        kb.append([
+    kb = InlineKeyboardMarkup([
+        [
             InlineKeyboardButton(
-                "🔎 Cari Produk",
-                callback_data="search"
+                '🛒 Tambah Keranjang',
+                callback_data=f'addcart:{pid}'
             )
-        ])
-
-        kb.append([
+        ],
+        [
             InlineKeyboardButton(
-                "⬅️ Kembali",
-                callback_data="home"
+                '⚡ Beli Sekarang',
+                callback_data=f'buy:{pid}'
             )
-        ])
-
-        await context.bot.send_message(
-            uid,
-            "🛒 *Katalog Produk*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-
-        return
-
-    # SEARCH
-    if data == "search":
-        context.user_data["searching"] = True
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            (
-                "🔎 Kirim nama/kata kunci produk "
-                "yang mau dicari.\n\n"
-                "Ketik /cancel untuk batal."
-            )
-        )
-
-        return
-
-    # CART
-    if data == "cart":
-        await safe_delete(q.message)
-        await show_cart(uid, context)
-        return
-
-    # CART PLUS / MINUS
-    if data.startswith("cartplus:") or data.startswith("cartminus:"):
-        pid = int(data.split(":")[1])
-
-        delta = (
-            1
-            if data.startswith("cartplus:")
-            else -1
-        )
-
-        con = db()
-
-        row = con.execute(
-            """
-            SELECT qty
-            FROM cart
-            WHERE user_id=?
-            AND product_id=?
-            """,
-            (uid, pid)
-        ).fetchone()
-
-        if not row:
-            con.close()
-
-            await q.answer(
-                "Produk tidak ada di keranjang.",
-                show_alert=True
-            )
-
-            return
-
-        new_qty = row[0] + delta
-
-        if new_qty <= 0:
-            con.execute(
-                """
-                DELETE FROM cart
-                WHERE user_id=?
-                AND product_id=?
-                """,
-                (uid, pid)
-            )
-
-        elif stock_ok(con, pid, new_qty):
-            con.execute(
-                """
-                UPDATE cart
-                SET qty=?
-                WHERE user_id=?
-                AND product_id=?
-                """,
-                (
-                    new_qty,
-                    uid,
-                    pid
-                )
-            )
-
-        else:
-            con.close()
-
-            await q.answer(
-                "❌ Stok tidak cukup.",
-                show_alert=True
-            )
-
-            return
-
-        con.commit()
-        con.close()
-
-        await show_cart(
-            uid,
-            context,
-            q.message
-        )
-
-        return
-
-    # CLEAR CART
-    if data == "cartclear":
-        con = db()
-
-        con.execute(
-            "DELETE FROM cart WHERE user_id=?",
-            (uid,)
-        )
-
-        con.commit()
-        con.close()
-
-        await show_cart(
-            uid,
-            context,
-            q.message
-        )
-
-        return
-
-    # PRODUCT DETAIL
-    if data.startswith("product:"):
-        pid = int(data.split(":")[1])
-
-        con = db()
-
-        product = con.execute(
-            """
-            SELECT
-                id,
-                name,
-                price,
-                description,
-                photo,
-                stock
-            FROM products
-            WHERE id=?
-            """,
-            (pid,)
-        ).fetchone()
-
-        con.close()
-
-        if not product:
-            await q.answer(
-                "Produk tidak ditemukan.",
-                show_alert=True
-            )
-            return
-
-        await safe_delete(q.message)
-
-        stock_text = (
-            "Unlimited"
-            if product[5] < 0
-            else f"{product[5]} Pcs"
-        )
-
-        text = (
-            f"🛍️ *{product[1]}*\n"
-            f"💰 Harga: `{product[2]}`\n"
-            f"📦 Stok: `{stock_text}`\n\n"
-            "📝 Deskripsi:\n"
-            f"{product[3] or 'Tidak ada deskripsi.'}"
-        )
-
-        if product[5] != 0:
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🛒 TAMBAH KE KERANJANG",
-                        callback_data=f"addcart:{product[0]}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⚡ BELI SEKARANG",
-                        callback_data=f"buy:{product[0]}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Katalog",
-                        callback_data="catalog"
-                    )
-                ]
-            ])
-        else:
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Katalog",
-                        callback_data="catalog"
-                    )
-                ]
-            ])
-
-        if product[4]:
-            await context.bot.send_photo(
-                uid,
-                photo=product[4],
-                caption=text,
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
-        else:
-            await context.bot.send_message(
-                uid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
-
-        return
-
-    # ADD CART
-    if data.startswith("addcart:"):
-        pid = int(data.split(":")[1])
-
-        con = db()
-
-        product = con.execute(
-            """
-            SELECT name,stock
-            FROM products
-            WHERE id=?
-            """,
-            (pid,)
-        ).fetchone()
-
-        if not product:
-            con.close()
-
-            await q.answer(
-                "Produk tidak ditemukan.",
-                show_alert=True
-            )
-
-            return
-
-        existing = con.execute(
-            """
-            SELECT qty
-            FROM cart
-            WHERE user_id=?
-            AND product_id=?
-            """,
-            (uid, pid)
-        ).fetchone()
-
-        new_qty = (
-            existing[0]
-            if existing
-            else 0
-        ) + 1
-
-        if (
-            product[1] == 0
-            or (
-                product[1] > 0
-                and new_qty > product[1]
-            )
-        ):
-            con.close()
-
-            await q.answer(
-                "❌ Stok tidak cukup.",
-                show_alert=True
-            )
-
-            return
-
-        con.execute(
-            """
-            INSERT INTO cart(
-                user_id,
-                product_id,
-                qty
-            )
-            VALUES(?,?,?)
-            ON CONFLICT(user_id,product_id)
-            DO UPDATE SET qty=excluded.qty
-            """,
-            (
-                uid,
-                pid,
-                new_qty
-            )
-        )
-
-        con.commit()
-        con.close()
-
-        await q.answer(
-            f"✅ {product[0]} masuk keranjang"
-        )
-
-        return
-
-    # BUY NOW
-    if data.startswith("buy:"):
-        pid = int(data.split(":")[1])
-
-        con = db()
-
-        product = con.execute(
-            """
-            SELECT
-                id,
-                name,
-                price,
-                stock,
-                photo
-            FROM products
-            WHERE id=?
-            """,
-            (pid,)
-        ).fetchone()
-
-        con.close()
-
-        if not product:
-            await q.answer(
-                "Produk tidak ditemukan.",
-                show_alert=True
-            )
-            return
-
-        if product[3] == 0:
-            await q.answer(
-                "❌ Stok habis.",
-                show_alert=True
-            )
-            return
-
-        rows = [(
-            product[0],
-            1,
-            product[1],
-            product[2],
-            product[3],
-            product[4],
-            ""
-        )]
-
-        oid, error = await create_order(
-            uid,
-            context,
-            rows
-        )
-
-        if error:
-            await q.answer(
-                "❌ " + error,
-                show_alert=True
-            )
-            return
-
-        await safe_delete(q.message)
-
-        await send_order_created(
-            uid,
-            context,
-            oid
-        )
-
-        return
-
-    # CHECKOUT
-    if data == "checkout":
-        rows = cart_rows(uid)
-
-        if not rows:
-            await q.answer(
-                "Keranjang kosong.",
-                show_alert=True
-            )
-            return
-
-        await safe_delete(q.message)
-
-        text = (
-            cart_text(rows)
-            + "\n\nKlik konfirmasi untuk "
-              "membuat order."
-        )
-
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ KONFIRMASI CHECKOUT",
-                    callback_data="checkout_confirm"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Keranjang",
-                    callback_data="cart"
-                )
-            ]
-        ])
-
-        await context.bot.send_message(
-            uid,
-            text,
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-
-        return
-
-    # CONFIRM CHECKOUT
-    if data == "checkout_confirm":
-        rows = cart_rows(uid)
-
-        if not rows:
-            await q.answer(
-                "Keranjang kosong.",
-                show_alert=True
-            )
-            return
-
-        oid, error = await create_order(
-            uid,
-            context,
-            rows
-        )
-
-        if error:
-            await q.answer(
-                "❌ " + error,
-                show_alert=True
-            )
-            return
-
-        await safe_delete(q.message)
-
-        await send_order_created(
-            uid,
-            context,
-            oid
-        )
-
-        return
-
-    # PAYMENT ORDER
-    if data.startswith("payorder:"):
-        oid = int(data.split(":")[1])
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            (
-                f"💳 *Pembayaran ORD-{oid:05d}*\n\n"
-                f"{get_payment()}\n\n"
-                "Kirim foto bukti pembayaran "
-                f"dengan caption `ORD-{oid:05d}`."
-            ),
-            parse_mode="Markdown",
-            reply_markup=order_buttons(
-                oid,
-                False
-            )
-        )
-
-        return
-
-    # PROOF HELP
-    if data.startswith("proofhelp:"):
-        oid = int(data.split(":")[1])
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            (
-                "📤 *Cara Kirim Bukti*\n\n"
-                "1. Bayar sesuai info pembayaran.\n"
-                "2. Kirim foto bukti ke chat bot.\n"
-                f"3. Caption wajib berisi `ORD-{oid:05d}`.\n"
-                "4. Admin akan mengecek."
-            ),
-            parse_mode="Markdown",
-            reply_markup=order_buttons(
-                oid,
-                False
-            )
-        )
-
-        return
-
-    # ORDERS
-    if data == "orders":
-        con = db()
-
-        rows = con.execute(
-            """
-            SELECT
-                o.id,
-                o.status,
-                COALESCE(
-                    (
-                        SELECT GROUP_CONCAT(
-                            name || ' × ' || qty,
-                            ', '
-                        )
-                        FROM order_items
-                        WHERE order_id=o.id
-                    ),
-                    p.name
-                ),
-                p.price
-            FROM orders o
-            JOIN products p
-                ON p.id=o.product_id
-            WHERE o.user_id=?
-            ORDER BY o.id DESC
-            LIMIT 15
-            """,
-            (uid,)
-        ).fetchall()
-
-        con.close()
-
-        if not rows:
-            text = "📦 Belum ada pesanan."
-        else:
-            text = (
-                "📦 *Pesanan Saya*\n\n"
-                +
-                "\n".join(
-                    (
-                        f"🆔 `ORD-{row[0]:05d}`\n"
-                        f"📦 {row[2]}\n"
-                        f"💰 {row[3]}\n"
-                        f"📌 {STATUS_TEXT.get(row[1], row[1])}\n"
-                    )
-                    for row in rows
-                )
-            )
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            text,
-            parse_mode="Markdown",
-            reply_markup=menu()
-        )
-
-        return
-
-    # PAYMENT
-    if data == "payment":
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            f"💳 *Pembayaran*\n\n{get_payment()}",
-            parse_mode="Markdown",
-            reply_markup=menu()
-        )
-
-        return
-
-    # SUPPORT
-    if data == "support":
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            (
-                "👨‍💻 *Contact Admin*\n\n"
-                f"{SUPPORT_USERNAME or 'Silakan hubungi admin toko.'}"
-            ),
-            parse_mode="Markdown",
-            reply_markup=menu()
-        )
-
-        return
-
-    # ADMIN HOME
-    if data == "adminhome":
-        if uid not in ADMIN_IDS:
-            return
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            "👑 *Admin Panel*",
-            parse_mode="Markdown",
-            reply_markup=admin_menu()
-        )
-
-        return
-
-    # ADMIN LIST
-    if data == "adminlist":
-        if uid not in ADMIN_IDS:
-            return
-
-        con = db()
-
-        rows = con.execute(
-            """
-            SELECT id,name,price,stock
-            FROM products
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-        con.close()
-
-        await safe_delete(q.message)
-
-        if not rows:
-            await context.bot.send_message(
-                uid,
-                "🛒 Katalog kosong.",
-                reply_markup=admin_menu()
-            )
-            return
-
-        kb = []
-
-        for pid, name, price, stock in rows:
-            stock_text = (
-                "∞"
-                if stock < 0
-                else str(stock)
-            )
-
-            kb.append([
-                InlineKeyboardButton(
-                    (
-                        f"🛍️ {name} • {price} "
-                        f"(Stok: {stock_text})"
-                    ),
-                    callback_data=f"adminview:{pid}"
-                )
-            ])
-
-        kb.append([
+        ],
+        [
             InlineKeyboardButton(
-                "⬅️ Admin Panel",
-                callback_data="adminhome"
+                '⬅️ Katalog',
+                callback_data='catalog'
             )
-        ])
+        ]
+    ])
 
-        await context.bot.send_message(
-            uid,
-            "👑 *Kelola Produk*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-
-        return
-
-    # ADMIN STATS
-    if data == "adminstats":
-        if uid not in ADMIN_IDS:
-            return
-
-        await safe_delete(q.message)
-
-        await send_admin_stats(
-            uid,
-            context
-        )
-
-        return
-
-    # ADMIN PAYMENT
-    if data == "adminpayment":
-        if uid not in ADMIN_IDS:
-            return
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            (
-                "💳 *Payment Saat Ini:*\n\n"
-                f"{get_payment()}\n\n"
-                "Untuk mengubah:\n"
-                "`/setpayment isi payment baru`"
-            ),
-            parse_mode="Markdown",
-            reply_markup=admin_menu()
-        )
-
-        return
-
-    # ADMIN ORDERS
-    if data == "adminorders":
-        if uid not in ADMIN_IDS:
-            return
-
-        con = db()
-
-        rows = con.execute(
-            """
-            SELECT
-                o.id,
-                p.name,
-                p.price,
-                o.status
-            FROM orders o
-            JOIN products p
-                ON p.id=o.product_id
-            ORDER BY o.id DESC
-            LIMIT 30
-            """
-        ).fetchall()
-
-        con.close()
-
-        await safe_delete(q.message)
-
-        if rows:
-            text = (
-                "📦 *Order Terbaru*\n\n"
-                +
-                "\n".join(
-                    (
-                        f"ORD-{row[0]:05d} • "
-                        f"{row[1]} • "
-                        f"{row[2]} • "
-                        f"{STATUS_TEXT.get(row[3], row[3])}"
-                    )
-                    for row in rows
-                )
-            )
-        else:
-            text = "📦 Belum ada order."
-
-        await context.bot.send_message(
-            uid,
-            text,
-            parse_mode="Markdown",
-            reply_markup=admin_menu()
-        )
-
-        return
-
-    # ADMIN PRODUCT VIEW
-    if data.startswith("adminview:"):
-        if uid not in ADMIN_IDS:
-            return
-
-        pid = int(data.split(":")[1])
-
-        con = db()
-
-        product = con.execute(
-            """
-            SELECT
-                id,
-                name,
-                price,
-                description,
-                photo,
-                stock
-            FROM products
-            WHERE id=?
-            """,
-            (pid,)
-        ).fetchone()
-
-        con.close()
-
-        if not product:
-            await q.answer(
-                "Produk tidak ditemukan.",
-                show_alert=True
-            )
-            return
-
-        await safe_delete(q.message)
-
-        stock_text = (
-            "Unlimited"
-            if product[5] < 0
-            else f"{product[5]} Pcs"
-        )
-
-        text = (
-            "👑 *Kelola Produk*\n\n"
-            f"🆔 ID: `{product[0]}`\n"
-            f"🛍️ {product[1]}\n"
-            f"💰 {product[2]}\n"
-            f"📦 Stok: `{stock_text}`\n"
-            f"📝 {product[3] or '-'}"
-        )
-
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🗑️ HAPUS",
-                    callback_data=f"admindelete:{product[0]}"
-                ),
-                InlineKeyboardButton(
-                    "✏️ EDIT",
-                    callback_data=f"adminedithelp:{product[0]}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Daftar Produk",
-                    callback_data="adminlist"
-                )
-            ]
-        ])
-
-        if product[4]:
-            await context.bot.send_photo(
-                uid,
-                photo=product[4],
-                caption=text,
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
-        else:
-            await context.bot.send_message(
-                uid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
-
-        return
-
-    # DELETE PRODUCT
-    if data.startswith("admindelete:"):
-        if uid not in ADMIN_IDS:
-            return
-
-        pid = int(data.split(":")[1])
-
-        con = db()
-
-        product = con.execute(
-            "SELECT name FROM products WHERE id=?",
-            (pid,)
-        ).fetchone()
-
-        if not product:
-            con.close()
-
-            await q.answer(
-                "Produk tidak ditemukan.",
-                show_alert=True
-            )
-
-            return
-
-        con.execute(
-            "DELETE FROM products WHERE id=?",
-            (pid,)
-        )
-
-        con.commit()
-        con.close()
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            f"🗑️ Produk *{product[0]}* berhasil dihapus.",
-            parse_mode="Markdown",
-            reply_markup=admin_menu()
-        )
-
-        return
-
-    # EDIT HELP
-    if data.startswith("adminedithelp:"):
-        if uid not in ADMIN_IDS:
-            return
-
-        pid = int(data.split(":")[1])
-
-        await safe_delete(q.message)
-
-        await context.bot.send_message(
-            uid,
-            (
-                f"✏️ *Edit Produk #{pid}*\n\n"
-                f"`/edit {pid} | Nama Baru | Harga Baru | "
-                "Deskripsi Baru | Stok`"
-            ),
-            parse_mode="Markdown",
-            reply_markup=admin_menu()
-        )
-
-        return
-
-    # SET STATUS
-    if data.startswith("setstatus:"):
-        if uid not in ADMIN_IDS:
-            return
-
-        _, status, oid_text = data.split(":")
-        oid = int(oid_text)
-
-        if status not in STATUS_TEXT:
-            await q.answer(
-                "Status tidak valid.",
-                show_alert=True
-            )
-            return
-
-        con = db()
-
-        row = con.execute(
-            """
-            SELECT
-                o.user_id,
-                p.name,
-                p.price
-            FROM orders o
-            JOIN products p
-                ON p.id=o.product_id
-            WHERE o.id=?
-            """,
-            (oid,)
-        ).fetchone()
-
-        if not row:
-            con.close()
-
-            await q.answer(
-                "Order tidak ditemukan.",
-                show_alert=True
-            )
-
-            return
-
-        con.execute(
-            """
-            UPDATE orders
-            SET status=?
-            WHERE id=?
-            """,
-            (status, oid)
-        )
-
-        con.commit()
-        con.close()
-
-        user_id, product, price = row
-
-        items = order_items_text(oid)
-
-        user_msg = (
-            "📦 *Update Order*\n\n"
-            f"🆔 `ORD-{oid:05d}`\n"
-            f"📦 {items or product}\n"
-            f"💰 {price}\n"
-            f"📌 Status: *{STATUS_TEXT[status]}*"
-        )
-
-        if status == "paid":
-            user_msg += (
-                "\n\n"
-                "🎁 Pembayaran dikonfirmasi. "
-                "Pesanan kamu sedang diproses."
-            )
-
+    if row['photo']:
         try:
-            await context.bot.send_message(
-                user_id,
-                user_msg,
-                parse_mode="Markdown"
+            await context.bot.send_photo(
+                update.effective_user.id,
+                photo=row['photo'],
+                caption=text,
+                parse_mode='Markdown',
+                reply_markup=kb
             )
-        except Exception:
-            logging.exception(
-                "User notification failed"
-            )
-
-        # APPROVED = kirim produk
-        if status == "paid":
-            await deliver_order(
-                oid,
-                user_id,
-                context
-            )
-
-        await q.answer(
-            f"Status: {STATUS_TEXT[status]}"
-        )
-
-        try:
-            if q.message.photo:
-                await q.edit_message_caption(
-                    caption=(
-                        f"{q.message.caption or ''}\n\n"
-                        f"📌 STATUS: {STATUS_TEXT[status]}"
-                    ),
-                    reply_markup=admin_order_buttons(oid)
-                )
-            else:
-                await q.edit_message_text(
-                    text=(
-                        f"{q.message.text or ''}\n\n"
-                        f"📌 STATUS: {STATUS_TEXT[status]}"
-                    ),
-                    reply_markup=admin_order_buttons(oid)
-                )
+            return
         except Exception:
             pass
 
+    await update.callback_query.message.edit_text(
+        text,
+        parse_mode='Markdown',
+        reply_markup=kb
+    )
+
+
+async def add_cart(update, context, pid):
+    uid = update.effective_user.id
+
+    c = db()
+
+    row = c.execute(
+        'SELECT stock,name FROM products WHERE id=?',
+        (pid,)
+    ).fetchone()
+
+    if not row:
+        c.close()
+        await update.callback_query.answer(
+            'Produk tidak ditemukan.',
+            show_alert=True
+        )
         return
 
+    existing = c.execute(
+        '''
+        SELECT quantity
+        FROM cart
+        WHERE user_id=? AND product_id=?
+        ''',
+        (uid, pid)
+    ).fetchone()
 
-# =========================================================
-# ADMIN
-# =========================================================
+    qty = (existing['quantity'] if existing else 0) + 1
 
-async def send_admin_stats(
-    chat_id,
-    context
+    if row['stock'] >= 0 and qty > row['stock']:
+        c.close()
+        await update.callback_query.answer(
+            'Stok tidak mencukupi.',
+            show_alert=True
+        )
+        return
+
+    c.execute(
+        '''
+        INSERT INTO cart(user_id,product_id,quantity)
+        VALUES(?,?,?)
+        ON CONFLICT(user_id,product_id)
+        DO UPDATE SET quantity=excluded.quantity
+        ''',
+        (uid, pid, qty)
+    )
+
+    c.commit()
+    c.close()
+
+    await update.callback_query.answer(
+        '✅ Ditambahkan ke keranjang.'
+    )
+
+
+async def buy_now(update, context, pid):
+    uid = update.effective_user.id
+
+    oid, error = create_single_order(
+        uid,
+        pid
+    )
+
+    if error:
+        await update.callback_query.answer(
+            error,
+            show_alert=True
+        )
+        return
+
+    await update.callback_query.answer(
+        'Order dibuat.'
+    )
+
+    await show_payment_for_order(
+        update,
+        context,
+        oid
+    )
+
+
+async def show_payment_for_order(
+    update,
+    context,
+    oid
 ):
-    con = db()
-
-    total_users = con.execute(
-        "SELECT COUNT(DISTINCT user_id) FROM users"
-    ).fetchone()[0]
-
-    total_products = con.execute(
-        "SELECT COUNT(*) FROM products"
-    ).fetchone()[0]
-
-    total_orders = con.execute(
-        "SELECT COUNT(*) FROM orders"
-    ).fetchone()[0]
-
-    total_paid = con.execute(
-        """
-        SELECT COUNT(*)
-        FROM orders
-        WHERE status IN ('paid','completed')
-        """
-    ).fetchone()[0]
-
-    con.close()
+    uid = update.effective_user.id
 
     text = (
-        "📊 *STATISTIK TOKO*\n\n"
-        f"👤 Total Pengguna: `{total_users}`\n"
-        f"🛍️ Total Produk: `{total_products}`\n"
-        f"📦 Total Transaksi: `{total_orders}`\n"
-        f"✅ Transaksi Berhasil: `{total_paid}`"
+        f'💳 *PEMBAYARAN*\n\n'
+        f'🧾 Order: `ORD-{oid:05d}`\n\n'
+        'Silakan pilih metode pembayaran:'
     )
 
-    await context.bot.send_message(
-        chat_id,
-        text,
-        parse_mode="Markdown",
-        reply_markup=admin_menu()
-    )
-
-
-async def admin_add(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    raw = update.message.text.partition(" ")[2].strip()
-
-    parts = [
-        x.strip()
-        for x in raw.split("|")
-    ]
-
-    if len(parts) < 2:
-        await update.message.reply_text(
-            (
-                "Format:\n"
-                "`/add Nama | Harga | Deskripsi | Stok`\n\n"
-                "Stok `-1` = unlimited."
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                '💙 DANA',
+                callback_data=f'choosemethod:DANA:{oid}'
             ),
-            parse_mode="Markdown"
+            InlineKeyboardButton(
+                '💚 GO-PAY',
+                callback_data=f'choosemethod:GOPAY:{oid}'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '🟦 QRIS',
+                callback_data=f'choosemethod:QRIS:{oid}'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '⬅️ Menu',
+                callback_data='home'
+            )
+        ]
+    ])
+
+    try:
+        await update.callback_query.message.edit_text(
+            text,
+            parse_mode='Markdown',
+            reply_markup=kb
+        )
+    except Exception:
+        await context.bot.send_message(
+            uid,
+            text,
+            parse_mode='Markdown',
+            reply_markup=kb
+        )
+
+
+async def select_payment(
+    update,
+    context,
+    method,
+    oid
+):
+    uid = update.effective_user.id
+
+    method_key = method.upper()
+
+    c = db()
+
+    order = c.execute(
+        'SELECT * FROM orders WHERE id=? AND user_id=?',
+        (oid, uid)
+    ).fetchone()
+
+    c.close()
+
+    if not order:
+        await update.callback_query.answer(
+            'Order tidak ditemukan.',
+            show_alert=True
         )
         return
 
-    name = parts[0]
-    price = parts[1]
-    desc = parts[2] if len(parts) > 2 else ""
-
-    stock = (
-        int(parts[3])
-        if len(parts) > 3
-        and parts[3].lstrip("-").isdigit()
-        else -1
+    payment_info = payment_value(
+        'GOPAY'
+        if method_key == 'GOPAY'
+        else method_key
     )
 
-    con = db()
+    if method_key == 'QRIS':
+        qris = payment_value('QRIS')
 
-    con.execute(
-        """
-        INSERT INTO products(
-            name,
-            price,
-            description,
-            stock
-        )
-        VALUES(?,?,?,?)
-        """,
-        (
-            name,
-            price,
-            desc,
-            stock
-        )
-    )
-
-    con.commit()
-    con.close()
-
-    await update.message.reply_text(
-        f"✅ Produk *{name}* berhasil ditambahkan.",
-        parse_mode="Markdown"
-    )
-
-
-async def admin_photo(update, context):
-    uid = update.effective_user.id
-    caption = (
-        update.message.caption or ""
-    ).strip()
-
-    # ADD PRODUK + FOTO
-    if (
-        uid in ADMIN_IDS
-        and caption.lower().startswith("/add")
-    ):
-        parts = [
-            x.strip()
-            for x in caption.partition(" ")[2]
-            .strip()
-            .split("|")
-        ]
-
-        if len(parts) < 2:
-            await update.message.reply_text(
-                (
-                    "❌ Format:\n"
-                    "`/add Nama | Harga | "
-                    "Deskripsi | Stok`"
-                ),
-                parse_mode="Markdown"
+        if not qris:
+            await update.callback_query.answer(
+                'QRIS belum diatur admin.',
+                show_alert=True
             )
             return
 
-        name = parts[0]
-        price = parts[1]
-        desc = (
-            parts[2]
-            if len(parts) > 2
-            else ""
-        )
-
-        stock = (
-            int(parts[3])
-            if len(parts) > 3
-            and parts[3].lstrip("-").isdigit()
-            else -1
-        )
-
-        photo_id = update.message.photo[-1].file_id
-
-        con = db()
-
-        con.execute(
-            """
-            INSERT INTO products(
-                name,
-                price,
-                description,
-                photo,
-                stock
+        try:
+            await context.bot.send_photo(
+                uid,
+                photo=qris,
+                caption=(
+                    f'🟦 *PEMBAYARAN QRIS*\n\n'
+                    f'🧾 Order: `ORD-{oid:05d}`\n'
+                    f'💰 Total: {order["total_price"]}\n\n'
+                    'Setelah pembayaran, kirim *bukti pembayaran '
+                    'berupa foto* di chat ini.'
+                ),
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            '📤 Kirim Bukti',
+                            callback_data=f'proofhelp:{oid}'
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            '⬅️ Menu',
+                            callback_data='home'
+                        )
+                    ]
+                ])
             )
-            VALUES(?,?,?,?,?)
-            """,
-            (
-                name,
-                price,
-                desc,
-                photo_id,
-                stock
+        except Exception:
+            await context.bot.send_message(
+                uid,
+                (
+                    f'🟦 *QRIS*\n\n'
+                    f'Order: `ORD-{oid:05d}`\n'
+                    f'Total: {order["total_price"]}\n\n'
+                    'QRIS gagal ditampilkan. Hubungi admin.'
+                ),
+                parse_mode='Markdown'
             )
-        )
 
-        con.commit()
-        con.close()
+    else:
+        if not payment_info:
+            await update.callback_query.answer(
+                'Metode pembayaran ini belum diatur admin.',
+                show_alert=True
+            )
+            return
 
-        await update.message.reply_text(
+        await context.bot.send_message(
+            uid,
             (
-                f"✅ Produk *{name}* "
-                "+ foto berhasil ditambahkan."
+                f'💳 *PEMBAYARAN {method_key}*\n\n'
+                f'🧾 Order: `ORD-{oid:05d}`\n'
+                f'💰 Total: {order["total_price"]}\n\n'
+                f'📱 Nomor/Akun:\n`{payment_info}`\n\n'
+                'Setelah pembayaran, kirim *bukti pembayaran '
+                'berupa foto* di chat ini.'
             ),
-            parse_mode="Markdown"
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        '📤 Kirim Bukti',
+                        callback_data=f'proofhelp:{oid}'
+                    )
+                ]
+            ])
         )
 
-        return
+    c = db()
 
-    # BUKTI PEMBAYARAN
-    match = re.search(
-        r"ORD-(\d+)",
-        caption.upper()
+    c.execute(
+        '''
+        UPDATE orders
+        SET payment_method=?
+        WHERE id=?
+        ''',
+        (method_key, oid)
     )
 
-    if not match:
+    c.commit()
+    c.close()
+
+    context.user_data['proof_order_id'] = oid
+
+
+async def proof_help(update, context, oid):
+    uid = update.effective_user.id
+
+    context.user_data['proof_order_id'] = oid
+
+    await update.callback_query.answer()
+
+    await context.bot.send_message(
+        uid,
+        (
+            f'📤 *UPLOAD BUKTI PEMBAYARAN*\n\n'
+            f'Order: `ORD-{oid:05d}`\n\n'
+            'Silakan kirim foto/screenshot bukti pembayaran '
+            'sebagai *foto*, bukan teks.\n\n'
+            'Setelah diterima, bukti akan otomatis dikirim '
+            'ke admin dan grup notifikasi.'
+        ),
+        parse_mode='Markdown'
+    )
+
+
+async def receive_proof(update, context):
+    uid = update.effective_user.id
+
+    if not update.message or not update.message.photo:
+        return
+
+    oid = context.user_data.get('proof_order_id')
+
+    if not oid:
         await update.message.reply_text(
-            (
-                "📸 Caption bukti wajib berisi "
-                "ID seperti `ORD-00001`."
-            ),
-            parse_mode="Markdown"
+            '⚠️ Pilih order terlebih dahulu, lalu pilih '
+            'Upload Bukti Pembayaran.'
         )
         return
 
-    oid = int(match.group(1))
+    c = db()
 
-    con = db()
-
-    row = con.execute(
-        """
+    order = c.execute(
+        '''
         SELECT
-            o.user_id,
-            p.name,
-            p.price
+            o.*,
+            p.name
         FROM orders o
-        JOIN products p
-            ON p.id=o.product_id
-        WHERE o.id=?
-        """,
-        (oid,)
+        LEFT JOIN products p
+          ON p.id=o.product_id
+        WHERE o.id=? AND o.user_id=?
+        ''',
+        (oid, uid)
     ).fetchone()
 
-    if not row:
-        con.close()
+    c.close()
 
+    if not order:
         await update.message.reply_text(
-            "❌ ID transaksi tidak ditemukan."
+            '❌ Order tidak ditemukan.'
         )
         return
 
-    user_id, product, price = row
+    username = (
+        f'@{update.effective_user.username}'
+        if update.effective_user.username
+        else '(tanpa username)'
+    )
 
-    if user_id != uid:
-        con.close()
+    now = datetime.now().strftime(
+        '%d-%m-%Y %H:%M:%S'
+    )
 
-        await update.message.reply_text(
-            "❌ Order ini bukan milik kamu."
-        )
-        return
+    caption = (
+        f'💰 *BUKTI PEMBAYARAN MASUK*\n\n'
+        f'🧾 No. ID: `ORD-{oid:05d}`\n'
+        f'👤 Telegram ID: `{uid}`\n'
+        f'🔗 Username: {username}\n'
+        f'📅 Tanggal: `{now}`\n'
+        f'📦 Produk: {order["name"] or "-"}\n'
+        f'🔢 Qty: {order["quantity"]}\n'
+        f'💰 Total: {order["total_price"] or "-"}\n'
+        f'💳 Metode: {order["payment_method"] or "-"}\n'
+        f'📌 Status: *Bukti diterima*'
+    )
 
-    con.execute(
-        """
+    c = db()
+
+    c.execute(
+        '''
         UPDATE orders
         SET status='proof_received'
         WHERE id=?
-        """,
+        ''',
         (oid,)
     )
 
-    con.commit()
-    con.close()
+    c.commit()
+    c.close()
 
-    await update.message.reply_text(
-        (
-            f"📸 Bukti `ORD-{oid:05d}` diterima.\n"
-            "Tunggu admin."
-        ),
-        parse_mode="Markdown"
-    )
-
-    items = order_items_text(oid)
+    photo_id = update.message.photo[-1].file_id
 
     await notify_admins(
         context,
+        caption,
+        reply_markup=order_admin_buttons(oid),
+        photo=photo_id
+    )
+
+    await update.message.reply_text(
         (
-            "🔔 *BUKTI PEMBAYARAN BARU*\n\n"
-            f"🆔 `ORD-{oid:05d}`\n"
-            f"👤 User ID: `{uid}`\n"
-            f"📦 {items or product}\n"
-            f"💰 {price}\n"
-            "📌 Status: Bukti diterima"
+            '✅ *BUKTI TERKIRIM*\n\n'
+            f'Order `ORD-{oid:05d}` sudah diterima.\n'
+            'Admin akan memverifikasi pembayaran kamu.'
         ),
-        admin_order_buttons(oid),
-        photo=update.message.photo[-1].file_id
+        parse_mode='Markdown',
+        reply_markup=main_menu()
+    )
+
+    context.user_data.pop(
+        'proof_order_id',
+        None
     )
 
 
-# =========================================================
-# SEARCH
-# =========================================================
+async def show_orders(update, context):
+    uid = update.effective_user.id
 
-async def search_message(update, context):
-    if not context.user_data.get("searching"):
-        return
+    c = db()
 
-    term = update.message.text.strip()
-
-    if not term:
-        return
-
-    con = db()
-
-    rows = con.execute(
-        """
-        SELECT id,name,price,stock
-        FROM products
-        WHERE name LIKE ?
-        OR description LIKE ?
-        ORDER BY id DESC
-        """,
-        (
-            f"%{term}%",
-            f"%{term}%"
-        )
-    ).fetchall()
-
-    con.close()
-
-    context.user_data["searching"] = False
-
-    if not rows:
-        await update.message.reply_text(
-            f"🔎 Tidak ada produk untuk `{term}`.",
-            parse_mode="Markdown",
-            reply_markup=menu()
-        )
-        return
-
-    kb = []
-
-    for row in rows:
-        stock_text = (
-            "∞"
-            if row[3] < 0
-            else str(row[3])
-        )
-
-        kb.append([
-            InlineKeyboardButton(
-                (
-                    f"🛍️ {row[1]} • {row[2]} "
-                    f"(Stok: {stock_text})"
-                ),
-                callback_data=f"product:{row[0]}"
-            )
-        ])
-
-    kb.append([
-        InlineKeyboardButton(
-            "⬅️ Menu",
-            callback_data="home"
-        )
-    ])
-
-    await update.message.reply_text(
-        f"🔎 *Hasil pencarian:* `{term}`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-
-async def cancel(update, context):
-    context.user_data["searching"] = False
-
-    await update.message.reply_text(
-        "❌ Pencarian dibatalkan.",
-        reply_markup=menu()
-    )
-
-
-# =========================================================
-# OTHER COMMANDS
-# =========================================================
-
-async def show_chat_id(update, context):
-    if update.effective_chat.type in (
-        "group",
-        "supergroup"
-    ):
-        await update.message.reply_text(
-            (
-                "🆔 *ID Grup Ini:*\n"
-                f"`{update.effective_chat.id}`\n\n"
-                "Masukkan ke Railway → Variables → "
-                "`ADMIN_GROUP_ID`."
-            ),
-            parse_mode="Markdown"
-        )
-
-    else:
-        await update.message.reply_text(
-            (
-                "🆔 Chat ID kamu: "
-                f"`{update.effective_chat.id}`"
-            ),
-            parse_mode="Markdown"
-        )
-
-
-async def admin_broadcast(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    msg = update.message.text.partition(" ")[2].strip()
-
-    if not msg:
-        await update.message.reply_text(
-            "Format: `/bc Pesan broadcast kamu`",
-            parse_mode="Markdown"
-        )
-        return
-
-    con = db()
-
-    users = con.execute(
-        "SELECT DISTINCT user_id FROM users"
-    ).fetchall()
-
-    con.close()
-
-    success = 0
-    fail = 0
-
-    for (user_id,) in users:
-        try:
-            await context.bot.send_message(
-                user_id,
-                f"📢 *PENGUMUMAN*\n\n{msg}",
-                parse_mode="Markdown"
-            )
-            success += 1
-
-        except Exception:
-            fail += 1
-
-    await update.message.reply_text(
-        (
-            "📢 *Broadcast Selesai*\n\n"
-            f"✅ Berhasil: `{success}`\n"
-            f"❌ Gagal: `{fail}`"
-        ),
-        parse_mode="Markdown"
-    )
-
-
-async def check_order_cmd(update, context):
-    raw = update.message.text.partition(" ")[2].strip()
-
-    match = re.search(
-        r"(\d+)",
-        raw
-    )
-
-    if not match:
-        await update.message.reply_text(
-            "Format: `/cek ORD-00001`",
-            parse_mode="Markdown"
-        )
-        return
-
-    oid = int(match.group(1))
-
-    con = db()
-
-    row = con.execute(
-        """
+    rows = c.execute(
+        '''
         SELECT
             o.id,
-            o.user_id,
-            p.name,
-            p.price,
-            o.status
+            o.total_price,
+            o.status,
+            o.payment_method,
+            o.created_at,
+            p.name
         FROM orders o
-        JOIN products p
-            ON p.id=o.product_id
-        WHERE o.id=?
-        """,
-        (oid,)
-    ).fetchone()
+        LEFT JOIN products p
+          ON p.id=o.product_id
+        WHERE o.user_id=?
+        ORDER BY o.id DESC
+        LIMIT 20
+        ''',
+        (uid,)
+    ).fetchall()
 
-    con.close()
+    c.close()
 
-    if not row:
-        await update.message.reply_text(
-            "❌ Order tidak ditemukan."
+    if not rows:
+        text = '📦 *PESANAN SAYA*\n\nBelum ada pesanan.'
+    else:
+        lines = [
+            '📦 *PESANAN SAYA*\n'
+        ]
+
+        for row in rows:
+            lines.append(
+                f'🧾 `ORD-{row["id"]:05d}`\n'
+                f'📦 {row["name"] or "-"}\n'
+                f'💰 {row["total_price"] or "-"}\n'
+                f'💳 {row["payment_method"] or "-"}\n'
+                f'📌 {STATUS_TEXT.get(row["status"], row["status"])}\n'
+                f'🕐 {row["created_at"]}\n'
+            )
+
+        text = '\n'.join(lines)
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                '⬅️ Menu',
+                callback_data='home'
+            )
+        ]
+    ])
+
+    try:
+        await update.callback_query.message.edit_text(
+            text,
+            parse_mode='Markdown',
+            reply_markup=kb
+        )
+    except Exception:
+        await context.bot.send_message(
+            uid,
+            text,
+            parse_mode='Markdown',
+            reply_markup=kb
+        )
+
+
+async def admin_panel(update, context):
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
+        await update.callback_query.answer(
+            'Akses ditolak.',
+            show_alert=True
         )
         return
 
-    items = order_items_text(oid)
-
-    await update.message.reply_text(
+    await update.callback_query.message.edit_text(
         (
-            "🔍 *DETAIL PESANAN*\n\n"
-            f"🆔 `ORD-{row[0]:05d}`\n"
-            f"👤 User ID: `{row[1]}`\n"
-            f"📦 Produk: {items or row[2]}\n"
-            f"💰 {row[3]}\n"
-            f"📌 Status: "
-            f"*{STATUS_TEXT.get(row[4], row[4])}*"
+            f'⚙️ *ADMIN PANEL*\n\n'
+            f'🏪 Store: *{store_name()}*\n\n'
+            'Pilih menu admin:'
         ),
-        parse_mode="Markdown"
-    )
-
-
-async def admin_stats_cmd(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    await send_admin_stats(
-        update.effective_user.id,
-        context
+        parse_mode='Markdown',
+        reply_markup=admin_menu()
     )
 
 
 async def admin_products(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
         return
 
-    await update.message.reply_text(
-        "👑 *Admin Panel*",
-        parse_mode="Markdown",
-        reply_markup=admin_menu()
+    c = db()
+
+    rows = c.execute(
+        'SELECT * FROM products ORDER BY id DESC'
+    ).fetchall()
+
+    c.close()
+
+    if not rows:
+        text = '📦 Belum ada produk.'
+    else:
+        text = '📦 *DAFTAR PRODUK*\n\n'
+
+        for row in rows:
+            text += (
+                f'#{row["id"]} — *{row["name"]}*\n'
+                f'Harga: {row["price"]}\n'
+                f'Stok: {row["stock"]}\n\n'
+            )
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                '➕ Tambah Produk',
+                callback_data='addproduct'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                '⬅️ Admin Panel',
+                callback_data='adminhome'
+            )
+        ]
+    ])
+
+    await update.callback_query.message.edit_text(
+        text,
+        parse_mode='Markdown',
+        reply_markup=kb
     )
 
 
-async def admin_delete(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
+async def admin_orders(update, context):
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
         return
 
-    if (
-        len(context.args) != 1
-        or not context.args[0].isdigit()
-    ):
+    c = db()
+
+    rows = c.execute(
+        '''
+        SELECT
+            o.id,
+            o.user_id,
+            o.quantity,
+            o.total_price,
+            o.status,
+            o.payment_method,
+            o.created_at,
+            p.name
+        FROM orders o
+        LEFT JOIN products p
+          ON p.id=o.product_id
+        ORDER BY o.id DESC
+        LIMIT 30
+        '''
+    ).fetchall()
+
+    c.close()
+
+    if not rows:
+        text = '📦 Belum ada order.'
+    else:
+        text = '📦 *ORDER TERBARU*\n\n'
+
+        for row in rows:
+            text += (
+                f'🧾 `ORD-{row["id"]:05d}`\n'
+                f'👤 `{row["user_id"]}`\n'
+                f'📦 {row["name"] or "-"}\n'
+                f'💰 {row["total_price"] or "-"}\n'
+                f'💳 {row["payment_method"] or "-"}\n'
+                f'📌 {STATUS_TEXT.get(row["status"], row["status"])}\n'
+                f'🕐 {row["created_at"]}\n\n'
+            )
+
+    await update.callback_query.message.edit_text(
+        text,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    '⬅️ Admin Panel',
+                    callback_data='adminhome'
+                )
+            ]
+        ])
+    )
+
+
+async def admin_payment(update, context):
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
+        return
+
+    dana = payment_value('DANA')
+    gopay = payment_value('GOPAY')
+    qris = payment_value('QRIS')
+
+    text = (
+        '💳 *METODE PEMBAYARAN*\n\n'
+        f'💙 DANA: `{dana or "Belum diatur"}`\n'
+        f'💚 GO-PAY: `{gopay or "Belum diatur"}`\n'
+        f'🟦 QRIS: '
+        f'{"✅ Sudah diupload" if qris else "❌ Belum diupload"}\n\n'
+        'Pilih metode yang ingin diubah.'
+    )
+
+    await update.callback_query.message.edit_text(
+        text,
+        parse_mode='Markdown',
+        reply_markup=admin_payment_menu()
+    )
+
+
+async def admin_store(update, context):
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
+        return
+
+    context.user_data['awaiting_store_name'] = True
+
+    await update.callback_query.message.edit_text(
+        (
+            '🏪 *EDIT NAMA STORE*\n\n'
+            'Kirim nama store baru sekarang.\n\n'
+            f'Nama sekarang: *{store_name()}*'
+        ),
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    '⬅️ Batal',
+                    callback_data='adminhome'
+                )
+            ]
+        ])
+    )
+
+
+async def set_payment_prompt(
+    update,
+    context,
+    method
+):
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
+        return
+
+    context.user_data['awaiting_payment'] = method
+
+    label = (
+        'GO-PAY'
+        if method == 'GOPAY'
+        else method
+    )
+
+    await update.callback_query.message.edit_text(
+        (
+            f'💳 *ATUR {label}*\n\n'
+            f'Kirim nomor / akun {label} sekarang.\n'
+            'Contoh: `08123456789`'
+        ),
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    '⬅️ Batal',
+                    callback_data='adminpayment'
+                )
+            ]
+        ])
+    )
+
+
+async def upload_qris_prompt(update, context):
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
+        return
+
+    context.user_data['awaiting_qris'] = True
+
+    await update.callback_query.message.edit_text(
+        (
+            '🟦 *UPLOAD QRIS*\n\n'
+            'Kirim gambar QRIS sebagai foto sekarang.\n'
+            'QRIS tersebut akan digunakan user saat memilih '
+            'metode pembayaran QRIS.'
+        ),
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    '⬅️ Batal',
+                    callback_data='adminpayment'
+                )
+            ]
+        ])
+    )
+
+
+async def receive_admin_text(update, context):
+    uid = update.effective_user.id
+
+    if uid not in ADMIN_IDS:
+        return False
+
+    text = (
+        update.message.text
+        if update.message
+        else ''
+    ).strip()
+
+    if context.user_data.get('awaiting_store_name'):
+        if not text:
+            return True
+
+        set_setting(
+            'store_name',
+            text[:100]
+        )
+
+        context.user_data.pop(
+            'awaiting_store_name',
+            None
+        )
+
         await update.message.reply_text(
-            "Format: /delete ID_PRODUK"
+            f'✅ Nama store diubah menjadi *{text[:100]}*.',
+            parse_mode='Markdown',
+            reply_markup=admin_menu()
+        )
+
+        return True
+
+    method = context.user_data.get(
+        'awaiting_payment'
+    )
+
+    if method:
+        set_setting(
+            f'payment_{method}',
+            text[:200]
+        )
+
+        context.user_data.pop(
+            'awaiting_payment',
+            None
+        )
+
+        await update.message.reply_text(
+            (
+                f'✅ Pembayaran {method} berhasil diatur.\n'
+                f'Akun: `{text[:200]}`'
+            ),
+            parse_mode='Markdown',
+            reply_markup=admin_payment_menu()
+        )
+
+        return True
+
+    if context.user_data.get('awaiting_add_product'):
+        parts = [p.strip() for p in text.split('\n') if p.strip()]
+        if len(parts) >= 2:
+            name = parts[0]
+            price = parts[1]
+            desc = parts[2] if len(parts) > 2 else ''
+            stock = int(parts[3]) if len(parts) > 3 and parts[3].lstrip('-').isdigit() else -1
+            delivery_text = parts[4] if len(parts) > 4 else ''
+
+            c = db()
+            c.execute(
+                '''
+                INSERT INTO products(name, price, description, stock, delivery_text)
+                VALUES(?,?,?,?,?)
+                ''',
+                (name, price, desc, stock, delivery_text)
+            )
+            c.commit()
+            c.close()
+
+            context.user_data.pop('awaiting_add_product', None)
+            await update.message.reply_text(
+                f'✅ Produk *{name}* berhasil ditambahkan!',
+                parse_mode='Markdown',
+                reply_markup=admin_menu()
+            )
+            return True
+        else:
+            await update.message.reply_text(
+                '⚠️ Format salah. Sertakan minimal Nama dan Harga (terpisah baris baru).'
+            )
+            return True
+
+    return False
+
+
+# --- FITUR PELENGKAP ---
+
+async def check_join(update, context):
+    q = update.callback_query
+    await q.answer()
+    if await joined(update, context):
+        await q.message.delete()
+        await replace_home(update.effective_user.id, context)
+    else:
+        await q.answer('⚠️ Kamu belum join grup!', show_alert=True)
+
+
+async def show_payment_menu(update, context):
+    text = (
+        '💳 *METODE PEMBAYARAN TERSEDIA*\n\n'
+        'Pilih salah satu metode pembayaran di bawah ini:'
+    )
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            text, parse_mode='Markdown', reply_markup=payment_menu()
+        )
+
+
+async def show_payment_method(update, context, method):
+    info = payment_value(method)
+    if method == 'QRIS':
+        if info:
+            try:
+                await context.bot.send_photo(
+                    update.effective_user.id,
+                    photo=info,
+                    caption='🟦 *PEMBAYARAN QRIS*\n\nSilakan scan QRIS di atas.',
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('⬅️ Kembali', callback_data='payment')]
+                    ])
+                )
+                return
+            except Exception:
+                pass
+        await update.callback_query.message.edit_text(
+            '❌ QRIS belum dikonfigurasi oleh admin.',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('⬅️ Kembali', callback_data='payment')]
+            ])
+        )
+    else:
+        val = info if info else 'Belum diatur oleh admin.'
+        await update.callback_query.message.edit_text(
+            f'💳 *METODE PEMBAYARAN {method}*\n\nDetail Akun:\n`{val}`',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('⬅️ Kembali', callback_data='payment')]
+            ])
+        )
+
+
+async def support(update, context):
+    username = SUPPORT_USERNAME.lstrip('@')
+    text = (
+        '👨‍💻 *BANTUAN & SUPPORT*\n\n'
+        'Jika ada kendala transaksi atau pertanyaan, hubungi admin:'
+    )
+    kb = []
+    if username:
+        kb.append([InlineKeyboardButton('💬 Hubungi Admin', url=f'https://t.me/{username}')])
+    kb.append([InlineKeyboardButton('⬅️ Menu', callback_data='home')])
+    
+    await update.callback_query.message.edit_text(
+        text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def search_prompt(update, context):
+    context.user_data['searching'] = True
+    await update.callback_query.answer()
+    await update.callback_query.message.edit_text(
+        '🔎 *CARI PRODUK*\n\nKetik kata kunci nama produk yang ingin kamu cari:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Batal', callback_data='home')]
+        ])
+    )
+
+
+async def do_search(update, context, keyword):
+    context.user_data.pop('searching', None)
+    c = db()
+    rows = c.execute(
+        'SELECT * FROM products WHERE name LIKE ? ORDER BY id DESC',
+        (f'%{keyword}%',)
+    ).fetchall()
+    c.close()
+
+    if not rows:
+        await update.message.reply_text(
+            f'🔎 Tidak ditemukan produk dengan kata kunci: *{keyword}*',
+            parse_mode='Markdown',
+            reply_markup=main_menu()
         )
         return
 
-    pid = int(context.args[0])
+    text = f'🔎 *HASIL PENCARIAN:* "{keyword}"\n\n'
+    buttons = []
+    for row in rows:
+        text += f'📦 *{row["name"]}* - {row["price"]}\n'
+        buttons.append([InlineKeyboardButton(f'🛒 {row["name"]}', callback_data=f'product:{row["id"]}')])
 
-    con = db()
+    buttons.append([InlineKeyboardButton('⬅️ Menu', callback_data='home')])
+    await update.message.reply_text(
+        text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
-    row = con.execute(
-        "SELECT name FROM products WHERE id=?",
-        (pid,)
+
+async def cart_change(update, context, pid, delta):
+    uid = update.effective_user.id
+    c = db()
+    row = c.execute('SELECT quantity FROM cart WHERE user_id=? AND product_id=?', (uid, pid)).fetchone()
+    
+    if row:
+        new_qty = row['quantity'] + delta
+        if new_qty <= 0:
+            c.execute('DELETE FROM cart WHERE user_id=? AND product_id=?', (uid, pid))
+        else:
+            if product_available(c, pid, new_qty):
+                c.execute('UPDATE cart SET quantity=? WHERE user_id=? AND product_id=?', (new_qty, uid, pid))
+            else:
+                await update.callback_query.answer('Stok tidak mencukupi.', show_alert=True)
+                c.close()
+                return
+        c.commit()
+    c.close()
+    await show_cart(update, context)
+
+
+async def clear_cart(update, context):
+    uid = update.effective_user.id
+    c = db()
+    c.execute('DELETE FROM cart WHERE user_id=?', (uid,))
+    c.commit()
+    c.close()
+    await update.callback_query.answer('Keranjang dikosongkan.')
+    await show_cart(update, context)
+
+
+async def checkout(update, context):
+    uid = update.effective_user.id
+    oid, error = create_cart_order(uid)
+    if error:
+        await update.callback_query.answer(error, show_alert=True)
+        return
+
+    await update.callback_query.answer('Checkout berhasil.')
+    await show_payment_for_order(update, context, oid)
+
+
+async def set_order_status(update, context, status, oid):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return
+
+    c = db()
+    c.execute('UPDATE orders SET status=? WHERE id=?', (status, oid))
+    c.commit()
+    
+    order = c.execute(
+        'SELECT o.*, p.name, p.delivery_text, p.delivery_file_id FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE o.id=?',
+        (oid,)
     ).fetchone()
+    c.close()
 
-    if not row:
-        con.close()
+    await update.callback_query.answer(f'Status diubah ke {status}')
 
-        await update.message.reply_text(
-            "❌ Produk tidak ditemukan."
-        )
+    if order:
+        user_id = order['user_id']
+        st_label = STATUS_TEXT.get(status, status)
+        
+        # Auto delivery jika status paid/completed
+        if status in ('paid', 'completed'):
+            msg_text = (
+                f'✅ *PESANAN DIKONFIRMASI*\n\n'
+                f'Order `ORD-{oid:05d}` telah dikonfirmasi!\n'
+                f'Status: *{st_label}*\n\n'
+            )
+            if order['delivery_text']:
+                msg_text += f'📦 *Detail Pengiriman/Item:*\n`{order["delivery_text"]}`\n'
+
+            await context.bot.send_message(user_id, msg_text, parse_mode='Markdown')
+            
+            if order['delivery_file_id']:
+                try:
+                    await context.bot.send_document(user_id, document=order['delivery_file_id'])
+                except Exception:
+                    pass
+        else:
+            await context.bot.send_message(
+                user_id,
+                f'ℹ️ Update Order `ORD-{oid:05d}`:\nStatus saat ini: *{st_label}*',
+                parse_mode='Markdown'
+            )
+
+    await admin_orders(update, context)
+
+
+async def add_product_prompt(update, context):
+    context.user_data['awaiting_add_product'] = True
+    await update.callback_query.message.edit_text(
+        '➕ *TAMBAH PRODUK BARU*\n\n'
+        'Kirim detail produk dengan format per baris:\n'
+        '`Nama Produk`\n'
+        '`Harga`\n'
+        '`Deskripsi` (opsional)\n'
+        '`Stok` (angka, opsional, default -1 = tak terbatas)\n'
+        '`Teks Auto-Delivery` (opsional)',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Batal', callback_data='adminlist')]
+        ])
+    )
+
+
+async def backup_db(update, context):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
         return
 
-    con.execute(
-        "DELETE FROM products WHERE id=?",
-        (pid,)
+    backup_filename = f'backup_store_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
+    shutil.copyfile(DB, backup_filename)
+    
+    try:
+        with open(backup_filename, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=uid,
+                document=f,
+                caption=f'💾 *BACKUP DATABASE*\nTanggal: `{datetime.now().strftime("%d-%m-%Y %H:%M:%S")}`',
+                parse_mode='Markdown'
+            )
+    except Exception as e:
+        await update.callback_query.answer('Gagal mengirim file backup.', show_alert=True)
+    finally:
+        if os.path.exists(backup_filename):
+            os.remove(backup_filename)
+
+
+async def admin_stats(update, context):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return
+
+    c = db()
+    total_users = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    total_products = c.execute('SELECT COUNT(*) FROM products').fetchone()[0]
+    total_orders = c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]
+    completed_orders = c.execute("SELECT COUNT(*) FROM orders WHERE status IN ('paid', 'completed')").fetchone()[0]
+    c.close()
+
+    text = (
+        '📊 *STATISTIK BOT*\n\n'
+        f'👥 Total Pengguna: *{total_users}*\n'
+        f'📦 Total Produk: *{total_products}*\n'
+        f'🧾 Total Order: *{total_orders}*\n'
+        f'✅ Order Sukses: *{completed_orders}*'
     )
 
-    con.commit()
-    con.close()
+    await update.callback_query.message.edit_text(
+        text,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Admin Panel', callback_data='adminhome')]
+        ])
+    )
+
+
+async def receive_text(update, context):
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+
+    # Mode pencarian
+    if context.user_data.get('searching'):
+        await do_search(update, context, text)
+        return
+
+    # Mode admin
+    if update.effective_user.id in ADMIN_IDS:
+        handled = await receive_admin_text(update, context)
+        if handled:
+            return
 
     await update.message.reply_text(
-        f"🗑️ Produk *{row[0]}* dihapus.",
-        parse_mode="Markdown"
+        'Gunakan menu tombol di bawah atau /start.',
+        reply_markup=main_menu()
     )
 
 
-async def admin_edit(update, context):
+async def admin_command(update, context):
     if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    parts = [
-        x.strip()
-        for x in update.message.text
-        .partition(" ")[2]
-        .strip()
-        .split("|")
-    ]
-
-    if (
-        len(parts) < 3
-        or not parts[0].isdigit()
-    ):
-        await update.message.reply_text(
-            (
-                "Format:\n"
-                "`/edit ID | Nama | Harga | "
-                "Deskripsi | Stok`"
-            ),
-            parse_mode="Markdown"
-        )
-        return
-
-    pid = int(parts[0])
-    name = parts[1]
-    price = parts[2]
-
-    desc = (
-        parts[3]
-        if len(parts) > 3
-        else ""
-    )
-
-    stock = (
-        int(parts[4])
-        if len(parts) > 4
-        and parts[4].lstrip("-").isdigit()
-        else -1
-    )
-
-    con = db()
-
-    cur = con.execute(
-        """
-        UPDATE products
-        SET
-            name=?,
-            price=?,
-            description=?,
-            stock=?
-        WHERE id=?
-        """,
-        (
-            name,
-            price,
-            desc,
-            stock,
-            pid
-        )
-    )
-
-    con.commit()
-    con.close()
-
-    await update.message.reply_text(
-        (
-            "✏️ Produk berhasil diedit."
-            if cur.rowcount
-            else "❌ Produk tidak ditemukan."
-        )
-    )
-
-
-async def admin_setpayment(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    value = update.message.text.partition(" ")[2].strip()
-
-    if not value:
-        await update.message.reply_text(
-            (
-                "Format:\n"
-                "`/setpayment QRIS: xxx | "
-                "DANA: xxx | Bank: xxx`"
-            ),
-            parse_mode="Markdown"
-        )
-        return
-
-    set_payment(value)
-
-    await update.message.reply_text(
-        "✅ Info pembayaran berhasil disimpan."
-    )
-
-
-async def adminpanel(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text('⛔ Akses ditolak.')
         return
 
     await update.message.reply_text(
-        "👑 *Admin Panel*",
-        parse_mode="Markdown",
+        '⚙️ *ADMIN PANEL*',
+        parse_mode='Markdown',
         reply_markup=admin_menu()
     )
 
 
-# =========================================================
-# MAIN
-# =========================================================
+async def photo_router(update, context):
+    # Foto QRIS dari admin
+    if (
+        update.effective_user.id in ADMIN_IDS
+        and context.user_data.get('awaiting_qris')
+    ):
+        photo_id = update.message.photo[-1].file_id
+
+        set_setting(
+            'QRIS',
+            photo_id
+        )
+
+        context.user_data.pop(
+            'awaiting_qris',
+            None
+        )
+
+        await update.message.reply_text(
+            '✅ QRIS berhasil disimpan.',
+            reply_markup=admin_payment_menu()
+        )
+
+        return
+
+    # Bukti pembayaran user
+    await receive_proof(update, context)
+
+
+async def callback_router(update, context):
+    q = update.callback_query
+    data = q.data or ''
+
+    if data == 'home':
+        await q.answer()
+        await replace_home(
+            update.effective_user.id,
+            context
+        )
+
+    elif data == 'catalog':
+        await q.answer()
+        await catalog(update, context)
+
+    elif data == 'cart':
+        await q.answer()
+        await show_cart(update, context)
+
+    elif data == 'payment':
+        await q.answer()
+        await show_payment_menu(update, context)
+
+    elif data == 'orders':
+        await q.answer()
+        await show_orders(update, context)
+
+    elif data == 'support':
+        await q.answer()
+        await support(update, context)
+
+    elif data == 'checkjoin':
+        await check_join(update, context)
+
+    elif data == 'search':
+        await search_prompt(update, context)
+
+    elif data.startswith('product:'):
+        pid = int(data.split(':')[1])
+        await q.answer()
+        await product_detail(update, context, pid)
+
+    elif data.startswith('addcart:'):
+        pid = int(data.split(':')[1])
+        await add_cart(update, context, pid)
+
+    elif data.startswith('buy:'):
+        pid = int(data.split(':')[1])
+        await buy_now(update, context, pid)
+
+    elif data.startswith('choosepay:'):
+        oid = int(data.split(':')[1])
+        await q.answer()
+        await show_payment_for_order(
+            update,
+            context,
+            oid
+        )
+
+    elif data.startswith('choosemethod:'):
+        _, method, oid = data.split(':')
+        await select_payment(
+            update,
+            context,
+            method,
+            int(oid)
+        )
+
+    elif data.startswith('proofhelp:'):
+        oid = int(data.split(':')[1])
+        await proof_help(
+            update,
+            context,
+            oid
+        )
+
+    elif data.startswith('paymethod:'):
+        method = data.split(':')[1]
+        await q.answer()
+        await show_payment_method(
+            update,
+            context,
+            method
+        )
+
+    # CART
+    elif data.startswith('cartplus:'):
+        pid = int(data.split(':')[1])
+        await cart_change(
+            update,
+            context,
+            pid,
+            1
+        )
+
+    elif data.startswith('cartminus:'):
+        pid = int(data.split(':')[1])
+        await cart_change(
+            update,
+            context,
+            pid,
+            -1
+        )
+
+    elif data == 'cartclear':
+        await clear_cart(update, context)
+
+    elif data == 'checkout':
+        await checkout(update, context)
+
+    # ADMIN
+    elif data == 'adminhome':
+        await q.answer()
+        await admin_panel(update, context)
+
+    elif data == 'adminlist':
+        await q.answer()
+        await admin_products(update, context)
+
+    elif data == 'adminorders':
+        await q.answer()
+        await admin_orders(update, context)
+
+    elif data == 'adminpayment':
+        await q.answer()
+        await admin_payment(update, context)
+
+    elif data == 'adminstore':
+        await q.answer()
+        await admin_store(update, context)
+
+    elif data == 'backup':
+        await q.answer()
+        await backup_db(update, context)
+
+    elif data == 'adminstats':
+        await q.answer()
+        await admin_stats(update, context)
+
+    elif data == 'addproduct':
+        await q.answer()
+        await add_product_prompt(
+            update,
+            context
+        )
+
+    elif data.startswith('setpay:'):
+        method = data.split(':')[1]
+        await q.answer()
+        await set_payment_prompt(
+            update,
+            context,
+            method
+        )
+
+    elif data == 'uploadqris':
+        await q.answer()
+        await upload_qris_prompt(
+            update,
+            context
+        )
+
+    elif data.startswith('setstatus:'):
+        _, status, oid = data.split(':')
+        await set_order_status(
+            update,
+            context,
+            status,
+            int(oid)
+        )
+
+    elif data == 'noop':
+        await q.answer()
+
 
 def main():
     if not TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN belum diisi."
+            'BOT_TOKEN belum diset.'
         )
 
-    db()
+    # Buat database/tabel
+    c = db()
+    c.close()
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application
+        .builder()
+        .token(TOKEN)
+        .build()
+    )
 
+    # Commands
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            'start',
+            start
+        )
     )
 
     app.add_handler(
-        CommandHandler("add", admin_add)
+        CommandHandler(
+            'admin',
+            admin_command
+        )
     )
 
+    # Semua tombol inline
     app.add_handler(
-        CommandHandler("products", admin_products)
+        CallbackQueryHandler(
+            callback_router
+        )
     )
 
-    app.add_handler(
-        CommandHandler("delete", admin_delete)
-    )
-
-    app.add_handler(
-        CommandHandler("edit", admin_edit)
-    )
-
-    app.add_handler(
-        CommandHandler("setpayment", admin_setpayment)
-    )
-
-    app.add_handler(
-        CommandHandler("admin", adminpanel)
-    )
-
-    app.add_handler(
-        CommandHandler("id", show_chat_id)
-    )
-
-    app.add_handler(
-        CommandHandler("bc", admin_broadcast)
-    )
-
-    app.add_handler(
-        CommandHandler("stats", admin_stats_cmd)
-    )
-
-    app.add_handler(
-        CommandHandler("cek", check_order_cmd)
-    )
-
-    app.add_handler(
-        CommandHandler("cancel", cancel)
-    )
-
+    # Foto
     app.add_handler(
         MessageHandler(
             filters.PHOTO,
-            admin_photo
+            photo_router
         )
     )
 
-    # Dipakai untuk fitur search.
+    # Text
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            search_message
+            receive_text
         )
     )
 
-    app.add_handler(
-        CallbackQueryHandler(callback)
+    print(
+        f'🔥 {store_name()} BOT RUNNING...'
     )
 
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True
+    )
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
