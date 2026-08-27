@@ -342,7 +342,14 @@ async def adminpanel(update,context):
 def main():
     if not TOKEN: raise RuntimeError("BOT_TOKEN belum diisi.")
     db(); app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("add",admin_add)); app.add_handler(CommandHandler("products",admin_products)); app.add_handler(CommandHandler("delete",admin_delete)); app.add_handler(CommandHandler("edit",admin_edit)); app.add_handler(CommandHandler("setpayment",admin_setpayment)); app.add_handler(CommandHandler("admin",adminpanel); app.add_handler(CommandHandler("id",show_chat_id)))
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("add",admin_add))
+    app.add_handler(CommandHandler("products",admin_products))
+    app.add_handler(CommandHandler("delete",admin_delete))
+    app.add_handler(CommandHandler("edit",admin_edit))
+    app.add_handler(CommandHandler("setpayment",admin_setpayment))
+    app.add_handler(CommandHandler("admin",adminpanel))
+    app.add_handler(CommandHandler("id",show_chat_id))
     app.add_handler(MessageHandler(filters.PHOTO,admin_photo)); app.add_handler(CallbackQueryHandler(callback)); app.run_polling()
 
 if __name__=="__main__": main()
