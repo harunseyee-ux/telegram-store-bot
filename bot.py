@@ -117,17 +117,28 @@ async def start(update, context):
     uid = update.effective_user.id
     uname = update.effective_user.username or ""
     con = db()
-    con.execute("INSERT OR REPLACE INTO users(user_id, username) VALUES(?,?)", (uid, uname))
+    con.execute("INSERT OR IGNORE INTO users(user_id, username) VALUES(?,?)", (uid, uname))
     con.commit(); con.close()
+
+    await safe_delete(update.message)
+
+    if "last_menu_id" in context.user_data:
+        try:
+            await context.bot.delete_message(chat_id=uid, message_id=context.user_data["last_menu_id"])
+        except Exception:
+            pass
 
     if not await is_joined(update, context):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔗 JOIN GRUP", url=f"https://t.me/{REQUIRED_CHAT.lstrip('@')}")],
             [InlineKeyboardButton("✅ SUDAH JOIN", callback_data="check_join")]
         ])
-        await update.message.reply_text("🔒 *Akses dikunci*\n\nJoin grup wajib terlebih dahulu, lalu tekan *SUDAH JOIN*.", parse_mode="Markdown", reply_markup=kb)
+        msg = await context.bot.send_message(uid, "🔒 *Akses dikunci*\n\nJoin grup wajib terlebih dahulu, lalu tekan *SUDAH JOIN*.", parse_mode="Markdown", reply_markup=kb)
+        context.user_data["last_menu_id"] = msg.message_id
         return
-    await update.message.reply_text("🔥 *Selamat datang di Store!*\nPilih menu di bawah.", parse_mode="Markdown", reply_markup=menu())
+
+    msg = await context.bot.send_message(uid, "🔥 *Selamat datang di Store!*\nPilih menu di bawah.", parse_mode="Markdown", reply_markup=menu())
+    context.user_data["last_menu_id"] = msg.message_id
 
 async def notify_admins(context, text, reply_markup=None, photo=None):
     sent = []
@@ -311,14 +322,14 @@ async def callback(update, context):
 
 async def send_admin_stats(chat_id, context):
     con = db()
-    tot_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    tot_users = con.execute("SELECT COUNT(DISTINCT user_id) FROM users").fetchone()[0]
     tot_products = con.execute("SELECT COUNT(*) FROM products").fetchone()[0]
     tot_orders = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     tot_paid = con.execute("SELECT COUNT(*) FROM orders WHERE status IN ('paid', 'completed')").fetchone()[0]
     con.close()
     
     text = (f"📊 *STATISTIK TOKO*\n\n"
-            f"👤 Total Pengguna: `{tot_users}`\n"
+            f"👤 Total Pengguna (Unik): `{tot_users}`\n"
             f"🛍️ Total Produk: `{tot_products}`\n"
             f"📦 Total Transaksi: `{tot_orders}`\n"
             f"✅ Transaksi Berhasil: `{tot_paid}`")
@@ -376,7 +387,7 @@ async def admin_broadcast(update, context):
         await update.message.reply_text("Format: `/bc Pesan broadcast kamu`", parse_mode="Markdown")
         return
     con = db()
-    users = con.execute("SELECT user_id FROM users").fetchall()
+    users = con.execute("SELECT DISTINCT user_id FROM users").fetchall()
     con.close()
     
     success, fail = 0, 0
